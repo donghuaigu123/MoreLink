@@ -360,6 +360,88 @@ public class LinkService extends Service {
         }
     }
 
+    /** Actively pair with a peer: send PAIR_REQ with our PIN and read the result. */
+    public static String pairWithPeer(Context c, String ip, int port, String pin) {
+        SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        String id = p.getString("id", "");
+        String name = p.getString("name", "Android");
+        try (Socket s = new Socket(ip, port)) {
+            s.setSoTimeout(8000);
+            OutputStream os = s.getOutputStream();
+            InputStream is = new BufferedInputStream(s.getInputStream());
+            Mlp.writeFrame(os, Mlp.TYPE_HELLO, Mlp.utf8(Mlp.helloJson(id, name, "android", Mlp.DATA_PORT)), null);
+            byte[] f = Mlp.readFrame(is, null);
+            if (f == null || Mlp.frameType(f) != Mlp.TYPE_HELLO) return "握手失败";
+            String peerJson = Mlp.str(Mlp.framePayload(f));
+            String peerId = Mlp.jsonString(peerJson, "id");
+            String req = "{\"pin\":\"" + Mlp.jsonEscape(pin) + "\",\"id\":\"" + Mlp.jsonEscape(id) +
+                    "\",\"name\":\"" + Mlp.jsonEscape(name) + "\"}";
+            Mlp.writeFrame(os, Mlp.TYPE_PAIR_REQ, Mlp.utf8(req), null);
+            byte[] res = Mlp.readFrame(is, null);
+            if (res == null || Mlp.frameType(res) != Mlp.TYPE_PAIR_RESULT) return "未收到配对结果";
+            boolean ok = Mlp.jsonString(Mlp.str(Mlp.framePayload(res)), "ok") != null;
+            // The result payload JSON has a boolean; check literal.
+            ok = Mlp.str(Mlp.framePayload(res)).contains("\"ok\":true");
+            if (!ok) return "对端拒绝了配对";
+            p.edit().putString("pin", pin).putBoolean("paired", true)
+                    .putString("peer", peerId == null ? "windows-peer" : peerId).apply();
+            statusStatic = "已配对 · PIN " + pin;
+            c.sendBroadcast(new Intent(ACTION_STATE));
+            return "配对成功";
+        } catch (Exception e) {
+            return "失败: " + e.getMessage();
+        }
+    }
+
+    /** Send a local file to a peer at ip:port (Android -> PC). */
+    public static String sendFile(Context c, String ip, int port, String path, String displayName) {
+        SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        if (!p.getBoolean("paired", false)) return "请先配对";
+        byte[] key = Mlp.deriveKey(p.getString("pin", ""), p.getString("id", ""), p.getString("peer", ""));
+        File src = new File(path);
+        if (!src.exists()) return "文件不存在";
+        long size = src.length();
+        try (Socket s = new Socket(ip, port); java.io.FileInputStream fis = new java.io.FileInputStream(src)) {
+            s.setSoTimeout(15000);
+            OutputStream os = s.getOutputStream();
+            InputStream is = new BufferedInputStream(s.getInputStream());
+            byte[] hello = Mlp.helloJson(p.getString("id", ""), p.getString("name", "Android"),
+                    "android", Mlp.DATA_PORT).getBytes(StandardCharsets.UTF_8);
+            Mlp.writeFrame(os, Mlp.TYPE_HELLO, hello, null);
+            byte[] f = Mlp.readFrame(is, null);
+            if (f == null || Mlp.frameType(f) != Mlp.TYPE_HELLO) return "握手失败";
+            String xferId = Mlp.makeId();
+            String offer = "{\"id\":\"" + Mlp.jsonEscape(xferId) + "\",\"name\":\"" +
+                    Mlp.jsonEscape(displayName == null ? src.getName() : displayName) +
+                    "\",\"size\":" + size + ",\"mime\":\"application/octet-stream\"}";
+            Mlp.writeFrame(os, Mlp.TYPE_FILE_OFFER, Mlp.utf8(offer), key);
+            byte[] ack = Mlp.readFrame(is, key);
+            if (ack == null || Mlp.frameType(ack) != Mlp.TYPE_FILE_ACK) return "对端未接受文件";
+            byte[] buf = new byte[256 << 10];
+            long offset = 0;
+            int n;
+            while ((n = fis.read(buf)) > 0) {
+                byte[] chunk = new byte[20 + n];
+                byte[] idb = Mlp.utf8(xferId);
+                System.arraycopy(idb, 0, chunk, 0, Math.min(16, idb.length));
+                chunk[16] = (byte)(offset >>> 24);
+                chunk[17] = (byte)(offset >>> 16);
+                chunk[18] = (byte)(offset >>> 8);
+                chunk[19] = (byte)(offset);
+                System.arraycopy(buf, 0, chunk, 20, n);
+                Mlp.writeFrame(os, Mlp.TYPE_FILE_CHUNK, chunk, key);
+                offset += n;
+            }
+            byte[] done = Mlp.readFrame(is, key); // FILE_DONE
+            fileCountStatic++;
+            statusStatic = "文件已发送: " + (displayName == null ? src.getName() : displayName);
+            c.sendBroadcast(new Intent(ACTION_STATE));
+            return "已发送";
+        } catch (Exception e) {
+            return "失败: " + e.getMessage();
+        }
+    }
+
     /** Generate a new pairing PIN and display it. */
     public static String newPin(Context c) {
         String pin = Mlp.makePin();

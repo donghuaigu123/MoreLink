@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 )
 
 const (
@@ -87,14 +86,20 @@ type FileDone struct {
 	SHA256 string `json:"sha256"`
 }
 
-// DeriveKey derives the AES-256 session key from a pairing PIN and the two
-// device IDs, in an order-independent way so both peers compute the same key.
+// DeriveKey derives the AES-256 session key from the pairing PIN.
+//
+// v2 change: the key depends ONLY on the shared PIN (with a domain separator).
+// The previous design also mixed in both device IDs, but the two apps did not
+// agree on those IDs (one used a hardcoded placeholder), so the keys never
+// matched and every encrypted message failed to decrypt. Deriving from the PIN
+// alone guarantees both peers compute the identical key regardless of which
+// IDs each side stored — this is the single most important fix for real
+// interoperability. Device IDs are still exchanged during HELLO for display.
 func DeriveKey(pin, idA, idB string) []byte {
-	lo, hi := idA, idB
-	if strings.Compare(lo, hi) > 0 {
-		lo, hi = hi, lo
-	}
-	sum := sha256.Sum256([]byte(pin + ":" + lo + ":" + hi))
+	// idA/idB are intentionally ignored; kept in the signature for source
+	// compatibility with v1 call sites and the protocol handshake.
+	_, _ = idA, idB
+	sum := sha256.Sum256([]byte("MoreLink-v2|pin:" + pin))
 	return sum[:]
 }
 

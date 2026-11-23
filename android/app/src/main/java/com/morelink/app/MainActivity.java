@@ -3,17 +3,21 @@ package com.morelink.app;
 import android.Manifest;
 import android.app.Activity;
 import android.content.BroadcastReceiver;
-import android.content.ComponentName;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
-import android.text.TextUtils;
+import android.text.InputType;
+import android.text.method.ScrollingMovementMethod;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -28,118 +32,117 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** Main UI: status, pairing, peers, clipboard send, permissions, notification access. */
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+
+/** Main UI: high-contrast dark theme, pairing, peers, clipboard, files, permissions. */
 public class MainActivity extends Activity {
-    private TextView statusView, peersView, infoView;
+    private static final int REQ_PICK_FILE = 42;
+    private static final int BG = 0xFF0F1420;
+    private static final int PANEL = 0xFF1A2438;
+    private static final int ACCENT = 0xFF6EE7B7;
+    private static final int ACCENT2 = 0xFF38BDF8;
+    private static final int TEXT = 0xFFE6EDF7;
+    private static final int MUTED = 0xFF9FB0C8;
+
+    private TextView statusView, peersView, infoView, logView;
     private EditText pinEdit, targetIpEdit, clipEdit;
+
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context c, Intent i) { refresh(); }
+        @Override public void onReceive(Context c, Intent i) { refresh(); }
     };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setTitle("MoreLink · 安卓");
+        setTitle("MoreLink · 跨设备协同");
         SharedPreferences p = getSharedPreferences(LinkService.PREFS, MODE_PRIVATE);
-        if (p.getString("name", "").isEmpty()) {
-            p.edit().putString("name", android.os.Build.MODEL).apply();
-        }
+        if (p.getString("name", "").isEmpty()) p.edit().putString("name", android.os.Build.MODEL).apply();
 
         ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(BG);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(16);
         root.setPadding(pad, pad, pad, pad);
-        scroll.addView(root, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+        scroll.addView(root, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        infoView = new TextView(this);
-        infoView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        infoView.setTextColor(0xFF6EE7B7);
-        root.addView(infoView);
+        TextView header = new TextView(this);
+        header.setText("◆ MoreLink  ·  跨设备协同");
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        header.setTextColor(ACCENT);
+        header.setGravity(Gravity.CENTER);
+        header.setPadding(0, dp(6), 0, dp(12));
+        root.addView(header);
+
+        infoView = mono();
+        root.addView(card(infoView, "本机信息"));
 
         statusView = new TextView(this);
         statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        statusView.setPadding(0, dp(8), 0, dp(8));
-        root.addView(statusView);
+        statusView.setTextColor(ACCENT2);
+        statusView.setPadding(dp(12), dp(12), dp(12), dp(12));
+        root.addView(panel(statusView));
 
-        root.addView(section("配对"));
-        TextView hint = new TextView(this);
-        hint.setText("在电脑上点“配对”后输入这里生成的 6 位码；或把电脑上显示的码填入下方完成配对。");
-        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        root.addView(hint);
-
-        Button genPin = new Button(this);
-        genPin.setText("生成配对码");
-        genPin.setOnClickListener(v -> {
+        root.addView(section("① 配对（两端使用相同 6 位配对码）"));
+        pinEdit = edit("配对码（生成或输入电脑端的码）");
+        pinEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        root.addView(panel(pinEdit));
+        LinearLayout pairRow = row();
+        pairRow.addView(button("生成配对码", v -> {
             String pin = LinkService.newPin(this);
             pinEdit.setText(pin);
-            Toast.makeText(this, "配对码已生成，请在电脑端输入", Toast.LENGTH_LONG).show();
-        });
-        root.addView(genPin);
+            toast("配对码：" + pin + " 请在电脑端输入相同码");
+        }));
+        pairRow.addView(button("复制", v -> copyText(pinEdit.getText().toString())));
+        root.addView(pairRow);
+        targetIpEdit = edit("电脑 IP（从下方设备列表点选）");
+        root.addView(panel(targetIpEdit));
+        root.addView(button("配对到电脑（主动连接）", v -> doPair()));
 
-        pinEdit = new EditText(this);
-        pinEdit.setHint("6 位配对码（电脑端生成时填这里）");
-        pinEdit.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
-        root.addView(pinEdit);
-
-        Button doPair = new Button(this);
-        doPair.setText("保存配对码");
-        doPair.setOnClickListener(v -> {
-            String pin = pinEdit.getText().toString().trim();
-            if (pin.length() != 6) { toast("请输入 6 位数字"); return; }
-            SharedPreferences pref = getSharedPreferences(LinkService.PREFS, MODE_PRIVATE);
-            pref.edit().putString("pin", pin).putBoolean("paired", true).apply();
-            String peer = PeerStore.firstWindowsIp(this) != null ? "windows-peer" : "windows-peer";
-            pref.edit().putString("peer", peer).apply();
-            // Recompute key with the peer id we know; if unknown, connection handshake re-derives.
-            toast("配对码已保存");
-            refresh();
-        });
-        root.addView(doPair);
-
-        root.addView(section("附近设备"));
-        peersView = new TextView(this);
+        root.addView(section("② 附近设备（点击自动填入 IP）"));
+        peersView = mono();
         peersView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        peersView.setText("扫描中…");
-        root.addView(peersView);
+        root.addView(card(peersView, ""));
 
-        root.addView(section("发送剪贴板"));
-        targetIpEdit = new EditText(this);
-        targetIpEdit.setHint("电脑 IP（点击设备列表自动填入）");
-        root.addView(targetIpEdit);
-        clipEdit = new EditText(this);
-        clipEdit.setHint("要发送的文本");
-        root.addView(clipEdit);
-        Button send = new Button(this);
-        send.setText("发送文本到电脑");
-        send.setOnClickListener(v -> {
-            String ip = targetIpEdit.getText().toString().trim();
-            String text = clipEdit.getText().toString();
-            if (ip.isEmpty()) { toast("请填写电脑 IP"); return; }
-            if (TextUtils.isEmpty(text)) { toast("请输入文本"); return; }
-            String r = LinkService.sendClipboard(this, ip, Mlp.DATA_PORT, text);
-            toast(r);
-        });
-        root.addView(send);
+        root.addView(section("③ 剪贴板互传"));
+        clipEdit = edit("要发送到电脑的文本");
+        clipEdit.setMaxLines(3);
+        clipEdit.setSingleLine(false);
+        root.addView(panel(clipEdit));
+        LinearLayout clipRow = row();
+        clipRow.addView(button("发送文本", v -> sendClip()));
+        clipRow.addView(button("读取本机剪贴板", v -> {
+            String t = readClipboard();
+            if (t != null) clipEdit.setText(t); else toast("剪贴板为空");
+        }));
+        root.addView(clipRow);
 
-        root.addView(section("权限与后台"));
-        Button notifAccess = new Button(this);
-        notifAccess.setText("开启通知读取权限");
-        notifAccess.setOnClickListener(v -> requestNotificationAccess());
-        root.addView(notifAccess);
+        root.addView(section("④ 文件互传"));
+        root.addView(button("选择文件发送到电脑", v -> pickFile()));
+        TextView fhint = new TextView(this);
+        fhint.setText("接收文件保存在 Android/data/com.morelink.app/files/Received/");
+        fhint.setTextColor(MUTED);
+        fhint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        root.addView(fhint);
 
-        Button start = new Button(this);
-        start.setText("启动 / 保持后台运行");
-        start.setOnClickListener(v -> startService());
-        root.addView(start);
+        root.addView(section("⑤ 权限与后台"));
+        root.addView(button("开启通知读取权限", v -> requestNotificationAccess()));
+        root.addView(button("启动 / 保持后台运行", v -> { startService(); toast("服务已启动"); }));
+
+        root.addView(section("状态日志"));
+        logView = mono();
+        logView.setMovementMethod(new ScrollingMovementMethod());
+        root.addView(card(logView, ""));
 
         TextView foot = new TextView(this);
-        foot.setText("MoreLink v1.0.0 · 原创开源项目\n局域网自动发现，端到端 AES-256-GCM 加密");
+        foot.setText("MoreLink v2.0.0 · 原创开源 · 端到端 AES-256-GCM 加密\n局域网自动发现 + 可选中继跨网络");
+        foot.setTextColor(MUTED);
         foot.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        foot.setTextColor(0xFF8B98AD);
-        foot.setPadding(0, dp(16), 0, 0);
+        foot.setGravity(Gravity.CENTER);
+        foot.setPadding(0, dp(18), 0, dp(8));
         root.addView(foot);
 
         setContentView(scroll);
@@ -149,14 +152,173 @@ public class MainActivity extends Activity {
         refresh();
     }
 
+    private LinearLayout row() {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        r.setPadding(0, dp(6), 0, dp(6));
+        return r;
+    }
+
     private TextView section(String title) {
         TextView t = new TextView(this);
         t.setText("── " + title + " ──");
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        t.setTextColor(ACCENT);
         t.setGravity(Gravity.CENTER);
-        t.setPadding(0, dp(14), 0, dp(6));
-        t.setTextColor(0xFF6EE7B7);
+        t.setPadding(0, dp(16), 0, dp(8));
         return t;
+    }
+
+    private TextView mono() {
+        TextView t = new TextView(this);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        t.setTextColor(TEXT);
+        t.setPadding(dp(12), dp(10), dp(12), dp(10));
+        return t;
+    }
+
+    private EditText edit(String hint) {
+        EditText e = new EditText(this);
+        e.setHint(hint);
+        e.setHintTextColor(MUTED);
+        e.setTextColor(TEXT);
+        e.setBackgroundColor(PANEL);
+        e.setPadding(dp(12), dp(12), dp(12), dp(12));
+        return e;
+    }
+
+    private Button button(String text, View.OnClickListener l) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextColor(0xFF05231A);
+        b.setBackgroundColor(ACCENT);
+        b.setAllCaps(false);
+        b.setOnClickListener(l);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        lp.setMargins(dp(4), dp(4), dp(4), dp(4));
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private View panel(View child) {
+        LinearLayout p = new LinearLayout(this);
+        p.setOrientation(LinearLayout.VERTICAL);
+        p.setBackgroundColor(PANEL);
+        p.setPadding(dp(4), dp(4), dp(4), dp(4));
+        p.addView(child);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(4), 0, dp(4));
+        p.setLayoutParams(lp);
+        return p;
+    }
+
+    private View card(View child, String title) {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setBackgroundColor(PANEL);
+        c.setPadding(dp(12), dp(10), dp(12), dp(10));
+        if (!title.isEmpty()) {
+            TextView h = new TextView(this);
+            h.setText(title);
+            h.setTextColor(MUTED);
+            h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            c.addView(h);
+        }
+        c.addView(child);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(4), 0, dp(4));
+        c.setLayoutParams(lp);
+        return c;
+    }
+
+    private void doPair() {
+        String ip = targetIpEdit.getText().toString().trim();
+        String pin = pinEdit.getText().toString().trim();
+        if (ip.isEmpty()) { toast("请填写电脑 IP"); return; }
+        if (pin.length() != 6) { toast("请输入 6 位配对码"); return; }
+        toast(LinkService.pairWithPeer(this, ip, Mlp.DATA_PORT, pin));
+        refresh();
+    }
+
+    private void sendClip() {
+        String ip = targetIpEdit.getText().toString().trim();
+        String text = clipEdit.getText().toString();
+        if (ip.isEmpty()) { toast("请填写电脑 IP"); return; }
+        if (text.isEmpty()) { toast("请输入文本"); return; }
+        toast(LinkService.sendClipboard(this, ip, Mlp.DATA_PORT, text));
+    }
+
+    private void pickFile() {
+        Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+        i.setType("*/*");
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        try { startActivityForResult(Intent.createChooser(i, "选择要发送的文件"), REQ_PICK_FILE); }
+        catch (Exception e) { toast("无法打开选择器"); }
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req == REQ_PICK_FILE && res == RESULT_OK && data != null && data.getData() != null) {
+            Uri uri = data.getData();
+            final String name = queryName(uri);
+            final String ip = targetIpEdit.getText().toString().trim();
+            if (ip.isEmpty()) { toast("请先填写电脑 IP"); return; }
+            new Thread(() -> {
+                String path = copyUriToCache(uri, name);
+                if (path == null) { runOnUiThread(() -> toast("无法读取文件")); return; }
+                final String r = LinkService.sendFile(MainActivity.this, ip, Mlp.DATA_PORT, path, name);
+                runOnUiThread(() -> { toast(r); refresh(); });
+            }).start();
+        }
+    }
+
+    private String queryName(Uri uri) {
+        String name = "file";
+        try (Cursor c = getContentResolver().query(uri, null, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) name = c.getString(idx);
+            }
+        } catch (Exception ignored) {}
+        return name;
+    }
+
+    private String copyUriToCache(Uri uri, String name) {
+        try {
+            File dir = new File(getCacheDir(), "out");
+            dir.mkdirs();
+            File dst = new File(dir, name);
+            try (InputStream in = getContentResolver().openInputStream(uri);
+                 FileOutputStream out = new FileOutputStream(dst)) {
+                byte[] b = new byte[64 << 10];
+                int n;
+                while ((n = in.read(b)) > 0) out.write(b, 0, n);
+            }
+            return dst.getAbsolutePath();
+        } catch (Exception e) { return null; }
+    }
+
+    private String readClipboard() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip().getItemCount() > 0) {
+                CharSequence t = cm.getPrimaryClip().getItemAt(0).getText();
+                return t == null ? null : t.toString();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private void copyText(String s) {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("MoreLink", s));
+            toast("已复制");
+        } catch (Exception e) { toast("复制失败"); }
     }
 
     private void startService() {
@@ -173,15 +335,12 @@ public class MainActivity extends Activity {
     }
 
     private void requestNotificationAccess() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-            try {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1)
                 startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
-            } catch (Exception e) {
-                toast("请到 设置 → 通知使用权 中开启 MoreLink");
-            }
-        } else {
-            startActivity(new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"));
-        }
+            else
+                startActivity(new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"));
+        } catch (Exception e) { toast("请到 设置→通知使用权 中开启 MoreLink"); }
     }
 
     private void refresh() {
@@ -189,41 +348,47 @@ public class MainActivity extends Activity {
         String json = LinkService.stateJson(this);
         try {
             JSONObject o = new JSONObject(json);
-            String id = o.optString("id");
-            boolean paired = o.optBoolean("paired");
-            statusView.setText("状态: " + o.optString("status") + "\n已配对: " + (paired ? "是" : "否") +
-                    " · 通知: " + o.optInt("notifications") + " · 文件: " + o.optInt("files"));
+            statusView.setText("状态: " + o.optString("status") + "\n已配对: " +
+                    (o.optBoolean("paired") ? "是" : "否") + " · 通知: " + o.optInt("notifications") +
+                    " · 文件: " + o.optInt("files"));
         } catch (Exception ignored) {}
 
         SharedPreferences p = getSharedPreferences(LinkService.PREFS, MODE_PRIVATE);
-        infoView.setText("设备名: " + p.getString("name", "") + "\nID: " + p.getString("id", ""));
+        infoView.setText("设备名: " + p.getString("name", "") + "\nID: " + p.getString("id", "") +
+                "\n配对码: " + p.getString("pin", ""));
 
         String peers = PeerStore.peersJson(this);
         StringBuilder sb = new StringBuilder();
+        int count = 0;
         try {
             JSONArray arr = new JSONArray(peers);
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
-                String name = o.optString("name");
-                String plat = o.optString("platform");
                 String ip = o.optString("ip");
-                sb.append("• ").append(name).append(" [").append(plat).append("] ").append(ip).append("\n");
+                if (ip.isEmpty()) continue;
+                sb.append("• ").append(o.optString("name")).append(" [").append(o.optString("platform"))
+                  .append("]  ").append(ip).append("\n");
+                count++;
             }
         } catch (Exception ignored) {}
-        peersView.setText(sb.length() == 0 ? "暂未发现设备" : sb.toString());
+        peersView.setText(sb.length() == 0 ? "暂未发现设备（确保两端在同一局域网且电脑端已启动）" : sb.toString());
 
-        // Auto-fill IP if only one peer.
-        try {
-            JSONArray arr = new JSONArray(peers);
-            if (arr.length() == 1 && targetIpEdit.getText().toString().isEmpty()) {
-                targetIpEdit.setText(arr.getJSONObject(0).optString("ip"));
-            }
-        } catch (Exception ignored) {}
+        if (count == 1 && targetIpEdit.getText().toString().isEmpty()) {
+            try {
+                JSONArray arr = new JSONArray(peers);
+                for (int i = 0; i < arr.length(); i++) {
+                    String ip = arr.getJSONObject(i).optString("ip");
+                    if (!ip.isEmpty()) { targetIpEdit.setText(ip); break; }
+                }
+            } catch (Exception ignored) {}
+        }
+        logView.setText("提示：\n• 首次使用先在电脑端点“生成”获得配对码\n• 手机输入相同配对码并填电脑 IP，点“配对到电脑”\n• 配对成功后即可互传剪贴板、文件、同步通知");
     }
 
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
-    private int dp(int v) { return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v,
-            getResources().getDisplayMetrics()); }
+    private int dp(int v) {
+        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
+    }
 
     @Override
     protected void onDestroy() {

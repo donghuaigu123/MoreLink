@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.MoreLink" parent="android:Theme.Material.Light.NoActionBar">
+    <style name="Theme.MoreLink" parent="android:Theme.Material.NoActionBar">
         <item name="android:colorPrimary">#0F1420</item>
+        <item name="android:colorPrimaryDark">#0A0E18</item>
         <item name="android:colorAccent">#6EE7B7</item>
         <item name="android:windowBackground">#0F1420</item>
         <item name="android:textColorPrimary">#E6EDF7</item>
+        <item name="android:textColorSecondary">#9FB0C8</item>
+        <item name="android:navigationBarColor">#0A0E18</item>
+        <item name="android:statusBarColor">#0A0E18</item>
     </style>
 </resources>

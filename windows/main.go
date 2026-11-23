@@ -1,5 +1,8 @@
-// MoreLink Windows — desktop client.
-// Provides a local Web UI on 127.0.0.1:47890 and speaks MLP v1.
+//go:build windows
+
+// MoreLink Windows — native GUI desktop client.
+// Pure Go + Win32, no console window, no browser, no external dependencies.
+// Works on Windows 7 SP1 and later.
 package main
 
 import (
@@ -9,19 +12,93 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
-	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/donghuaigu123/MoreLink/internal/mlp"
+	"github.com/donghuaigu123/MoreLink/winui"
 )
+
+// ---------- Win32 clipboard (works on Windows 7, unlike Set-Clipboard) ----------
+
+var (
+	k32           = syscall.NewLazyDLL("kernel32.dll")
+	u32           = syscall.NewLazyDLL("user32.dll")
+	pOpenClipboard    = u32.NewProc("OpenClipboard")
+	pCloseClipboard   = u32.NewProc("CloseClipboard")
+	pEmptyClipboard   = u32.NewProc("EmptyClipboard")
+	pSetClipboardData = u32.NewProc("SetClipboardData")
+	pGetClipboardData = u32.NewProc("GetClipboardData")
+	pGlobalAlloc      = k32.NewProc("GlobalAlloc")
+	pGlobalFree       = k32.NewProc("GlobalFree")
+	pGlobalLock       = k32.NewProc("GlobalLock")
+	pGlobalUnlock     = k32.NewProc("GlobalUnlock")
+)
+
+const (
+	CF_UNICODETEXT = 13
+	GMEM_MOVEABLE  = 0x0002
+)
+
+func setClipboardWin(text string) error {
+	pOpenClipboard.Call(0)
+	_, _, _ = pEmptyClipboard.Call()
+	data, _ := syscall.UTF16FromString(text)
+	size := uintptr(len(data)) * 2
+	hMem, _, _ := pGlobalAlloc.Call(GMEM_MOVEABLE, size)
+	if hMem == 0 {
+		_, _, _ = pCloseClipboard.Call()
+		return fmt.Errorf("GlobalAlloc failed")
+	}
+	ptr, _, _ := pGlobalLock.Call(hMem)
+	copy((*[1 << 30]uint16)(unsafe.Pointer(ptr))[:len(data)], data)
+	_, _, _ = pGlobalUnlock.Call(hMem)
+	ret, _, err := pSetClipboardData.Call(CF_UNICODETEXT, hMem)
+	_, _, _ = pCloseClipboard.Call()
+	if ret == 0 {
+		// Ownership did not transfer; we must free it ourselves.
+		_, _, _ = pGlobalFree.Call(hMem)
+		if err != nil && err != syscall.Errno(0) {
+			return err
+		}
+		return fmt.Errorf("SetClipboardData failed")
+	}
+	// On success the system owns hMem — do NOT free it.
+	return nil
+}
+
+func getClipboardWin() string {
+	if r, _, _ := pOpenClipboard.Call(0); r == 0 {
+		return ""
+	}
+	defer pCloseClipboard.Call()
+	h, _, _ := pGetClipboardData.Call(CF_UNICODETEXT)
+	if h == 0 {
+		return ""
+	}
+	ptr, _, _ := pGlobalLock.Call(h)
+	if ptr == 0 {
+		return ""
+	}
+	n := 0
+	max := 1 << 20
+	arr := (*[1 << 20]uint16)(unsafe.Pointer(ptr))[:max:max]
+	for n < max && arr[n] != 0 {
+		n++
+	}
+	s := syscall.UTF16ToString(arr[:n])
+	_, _, _ = pGlobalUnlock.Call(h)
+	return s
+}
+
+// ---------- application state ----------
 
 type peer struct {
 	ID       string `json:"id"`
@@ -29,8 +106,6 @@ type peer struct {
 	Platform string `json:"platform"`
 	IP       string `json:"ip"`
 	Port     int    `json:"port"`
-	Room     string `json:"room"`
-	Online   bool   `json:"online"`
 	LastSeen int64  `json:"lastSeen"`
 }
 
@@ -42,25 +117,39 @@ type notifyItem struct {
 }
 
 type transferItem struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	Dir    string `json:"dir"`
-	Status string `json:"status"`
+	ID     string  `json:"id"`
+	Name   string  `json:"name"`
+	Size   int64   `json:"size"`
+	Got    int64   `json:"got"`
+	Dir    string  `json:"dir"`
+	Status string  `json:"status"`
+	Out    bool    `json:"out"`
+	Pct    float64 `json:"pct"`
 }
 
 type app struct {
-	mu       sync.Mutex
-	id       string
-	name     string
-	key      []byte
-	paired   bool
-	pin      string
-	peers    map[string]*peer
-	notifies []notifyItem
+	mu        sync.Mutex
+	id        string
+	name      string
+	pin       string
+	key       []byte
+	paired    bool
+	peers     map[string]*peer
+	notifies  []notifyItem
 	transfers []transferItem
-	download string
-	status   string
+	download  string
+	status    string
+	log       []string
+	relayAddr string
+	room      string
+
+	win     *winui.Window
+	ctrlPin *winui.Control
+	ctrlPeers *winui.Control
+	ctrlNotify *winui.Control
+	ctrlLog *winui.Control
+	ctrlStatus *winui.Control
+	ctrlID *winui.Control
 }
 
 func newApp() *app {
@@ -80,45 +169,63 @@ func hostName() string {
 	if h, err := os.Hostname(); err == nil && h != "" {
 		return h
 	}
-	return "Windows"
+	return "Windows-PC"
 }
 
-func (a *app) self() mlp.Hello {
+func (a *app) logf(format string, args ...interface{}) {
+	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+	a.mu.Lock()
+	a.log = append(a.log, line)
+	if len(a.log) > 200 {
+		a.log = a.log[1:]
+	}
+	a.mu.Unlock()
+}
+
+func (a *app) setStatus(s string) {
+	a.mu.Lock()
+	a.status = s
+	a.mu.Unlock()
+}
+
+func (a *app) hello() mlp.Hello {
 	return mlp.Hello{V: 1, ID: a.id, Name: a.name, Platform: "windows", TCP: mlp.DataPort}
 }
 
 func (a *app) helloJSON() []byte {
-	b, _ := json.Marshal(a.self())
+	b, _ := json.Marshal(a.hello())
 	return b
 }
 
-// pairFromUI is called by the Web UI when the user enters a 6-digit PIN
-// displayed on the phone. It returns the derived key.
-func (a *app) pairFromUI(pin, peerID string) ([]byte, error) {
+// ---------- pairing ----------
+
+func (a *app) pair(pin, peerID string) error {
 	if len(pin) != 6 {
-		return nil, fmt.Errorf("PIN 必须为 6 位数字")
+		return fmt.Errorf("配对码必须是 6 位数字")
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.pin = pin
 	a.key = mlp.DeriveKey(pin, a.id, peerID)
 	a.paired = true
-	a.status = "已配对"
-	return a.key, nil
+	a.status = "已配对 · PIN " + pin
+	a.mu.Unlock()
+	a.logf("配对成功，PIN=%s，对端=%s", pin, peerID)
+	return nil
 }
 
-// discoveryLoop broadcasts and collects LAN peers.
+// ---------- discovery ----------
+
 func (a *app) discoveryLoop(stop <-chan struct{}) {
-	listen, err := mlp.Announce(a.self())
+	ln, err := mlp.Announce(a.hello())
 	if err != nil {
-		log.Printf("discovery: %v", err)
+		a.logf("局域网发现失败: %v", err)
 		return
 	}
-	defer listen.Close()
-	go mlp.StartBeacon(a.self(), stop)
+	defer ln.Close()
+	go mlp.StartBeacon(a.hello(), stop)
 
-	ch := make(chan mlp.Hello, 32)
-	go mlp.ListenDiscovery(listen, ch, stop)
+	ch := make(chan mlp.Hello, 64)
+	go mlp.ListenDiscovery(ln, ch, stop)
 	for {
 		select {
 		case <-stop:
@@ -127,9 +234,6 @@ func (a *app) discoveryLoop(stop <-chan struct{}) {
 			if h.ID == a.id {
 				continue
 			}
-			// Sender IP is not carried in Hello; resolve from unicast source
-			// by performing a direct probe. For LAN we store IP from the
-			// discovery socket via a parallel map filled in listenLAN.
 			a.mu.Lock()
 			p := a.peers[h.ID]
 			if p == nil {
@@ -141,13 +245,13 @@ func (a *app) discoveryLoop(stop <-chan struct{}) {
 				p.IP = h.IP
 			}
 			p.LastSeen = time.Now().Unix()
-			p.Online = true
 			a.mu.Unlock()
 		}
 	}
 }
 
-// serveTCP accepts MLP connections from the phone or relay.
+// ---------- TCP server ----------
+
 func (a *app) serveTCP(ln net.Listener) {
 	for {
 		c, err := ln.Accept()
@@ -163,54 +267,50 @@ func (a *app) handleConn(c net.Conn) {
 	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
 	r := bufio.NewReader(c)
 
-	// Handshake: plaintext HELLO both ways.
-	mlp.WriteFrame(c, mlp.TypeHello, a.helloJSON(), nil)
+	_ = mlp.WriteFrame(c, mlp.TypeHello, a.helloJSON(), nil)
 	typ, payload, err := mlp.ReadFrame(r, nil)
 	if err != nil || typ != mlp.TypeHello {
 		return
 	}
 	var hello mlp.Hello
-	if json.Unmarshal(payload, &hello) != nil {
+	if json.Unmarshal(payload, &hello) != nil || hello.ID == "" {
 		return
 	}
 
 	a.mu.Lock()
 	key := a.key
-	peerID := hello.ID
-	a.peers[peerID] = &peer{
-		ID: peerID, Name: hello.Name, Platform: hello.Platform,
-		IP: strings.Split(c.RemoteAddr().String(), ":")[0], Port: hello.TCP,
-		Online: true, LastSeen: time.Now().Unix(),
+	a.peers[hello.ID] = &peer{
+		ID: hello.ID, Name: hello.Name, Platform: hello.Platform,
+		IP: strings.Split(c.RemoteAddr().String(), ":")[0],
+		Port: hello.TCP, LastSeen: time.Now().Unix(),
 	}
 	a.mu.Unlock()
+
 	if !a.paired || key == nil {
-		// Not paired yet: wait for a plaintext pairing request.
 		typ, payload, err = mlp.ReadFrame(r, nil)
 		if err != nil || typ != mlp.TypePairReq {
 			return
 		}
 		var req mlp.PairReq
-		if json.Unmarshal(payload, &req) != nil {
-			return
-		}
-		if len(req.PIN) != 6 {
+		if json.Unmarshal(payload, &req) != nil || len(req.PIN) != 6 {
 			res, _ := json.Marshal(mlp.PairResult{OK: false})
-			mlp.WriteFrame(c, mlp.TypePairResult, res, nil)
+			_ = mlp.WriteFrame(c, mlp.TypePairResult, res, nil)
 			return
 		}
 		a.mu.Lock()
 		a.pin = req.PIN
 		a.key = mlp.DeriveKey(req.PIN, a.id, req.ID)
-		a.paired = true
 		key = a.key
-		a.status = "已配对"
+		a.paired = true
+		a.status = "已配对 · PIN " + req.PIN
 		a.mu.Unlock()
+		a.logf("手机发起配对，PIN=%s", req.PIN)
 		res, _ := json.Marshal(mlp.PairResult{OK: true, Token: "ok"})
-		mlp.WriteFrame(c, mlp.TypePairResult, res, nil)
+		_ = mlp.WriteFrame(c, mlp.TypePairResult, res, nil)
 	}
 
-	// From here on everything is encrypted.
 	_ = c.SetDeadline(time.Time{})
+	a.logf("设备 %s 已连接", hello.Name)
 	for {
 		t, p, err := mlp.ReadFrame(r, key)
 		if err != nil {
@@ -218,30 +318,32 @@ func (a *app) handleConn(c net.Conn) {
 		}
 		switch t {
 		case mlp.TypePing:
-			mlp.WriteFrame(c, mlp.TypePong, nil, key)
+			_ = mlp.WriteFrame(c, mlp.TypePong, nil, key)
 		case mlp.TypeClipText:
-			a.setClipboard(string(p))
-			a.mu.Lock()
-			a.status = "收到剪贴板文本"
-			a.mu.Unlock()
+			if err := setClipboardWin(string(p)); err == nil {
+				a.setStatus("已接收剪贴板文本")
+				a.logf("收到剪贴板文本 (%d 字符)", len(string(p)))
+			}
 		case mlp.TypeNotify:
 			var n mlp.Notify
 			if json.Unmarshal(p, &n) == nil {
 				a.mu.Lock()
 				a.notifies = append([]notifyItem{{n.App, n.Title, n.Text, n.TS}}, a.notifies...)
-				if len(a.notifies) > 100 {
-					a.notifies = a.notifies[:100]
+				if len(a.notifies) > 200 {
+					a.notifies = a.notifies[:200]
 				}
 				a.mu.Unlock()
-				showToast(n.Title, n.Text)
+				a.logf("收到通知: %s — %s", n.Title, n.Text)
 			}
 		case mlp.TypeFileOffer:
-			go a.receiveFile(c, p, key)
+			// FIX: handle file receive INLINE on the same reader to avoid the
+			// data race caused by two bufio.Readers on one socket.
+			a.receiveFile(c, r, p, key)
 		}
 	}
 }
 
-func (a *app) receiveFile(c net.Conn, offerBytes []byte, key []byte) {
+func (a *app) receiveFile(c net.Conn, r *bufio.Reader, offerBytes []byte, key []byte) {
 	var of mlp.FileOffer
 	if json.Unmarshal(offerBytes, &of) != nil {
 		return
@@ -250,12 +352,16 @@ func (a *app) receiveFile(c net.Conn, offerBytes []byte, key []byte) {
 	dst := filepath.Join(a.download, safe)
 	f, err := os.Create(dst)
 	if err != nil {
+		a.logf("文件接收失败: %v", err)
 		return
 	}
 	defer f.Close()
 
 	a.mu.Lock()
-	a.transfers = append([]transferItem{{ID: of.ID, Name: of.Name, Size: of.Size, Dir: dst, Status: "接收中"}}, a.transfers...)
+	a.transfers = append([]transferItem{{
+		ID: of.ID, Name: of.Name, Size: of.Size, Dir: dst, Status: "接收中",
+	}}, a.transfers...)
+	idx := 0
 	a.mu.Unlock()
 
 	ack, _ := json.Marshal(mlp.FileAck{ID: of.ID, Offset: 0, OK: true})
@@ -263,11 +369,11 @@ func (a *app) receiveFile(c net.Conn, offerBytes []byte, key []byte) {
 
 	var got int64
 	var lastAck int64
-	r := bufio.NewReader(c)
 	for got < of.Size {
-		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_ = c.SetReadDeadline(time.Now().Add(120 * time.Second))
 		t, p, err := mlp.ReadFrame(r, key)
 		if err != nil {
+			a.logf("文件接收中断: %v", err)
 			return
 		}
 		if t != mlp.TypeFileChunk || len(p) < 20 {
@@ -283,6 +389,14 @@ func (a *app) receiveFile(c net.Conn, offerBytes []byte, key []byte) {
 			ackBytes, _ := json.Marshal(mlp.FileAck{ID: of.ID, Offset: got, OK: true})
 			_ = mlp.WriteFrame(c, mlp.TypeFileAck, ackBytes, key)
 			lastAck = got
+			a.mu.Lock()
+			if idx < len(a.transfers) {
+				a.transfers[idx].Got = got
+				if of.Size > 0 {
+					a.transfers[idx].Pct = float64(got) / float64(of.Size) * 100
+				}
+			}
+			a.mu.Unlock()
 		}
 	}
 	h := sha256.New()
@@ -292,42 +406,90 @@ func (a *app) receiveFile(c net.Conn, offerBytes []byte, key []byte) {
 	done, _ := json.Marshal(mlp.FileDone{ID: of.ID, SHA256: fmt.Sprintf("%x", h.Sum(nil))})
 	_ = mlp.WriteFrame(c, mlp.TypeFileDone, done, key)
 	a.mu.Lock()
-	for i := range a.transfers {
-		if a.transfers[i].ID == of.ID {
-			a.transfers[i].Status = "已完成"
-		}
+	if idx < len(a.transfers) {
+		a.transfers[idx].Status = "已完成"
+		a.transfers[idx].Pct = 100
 	}
 	a.status = "文件已接收: " + safe
 	a.mu.Unlock()
+	a.logf("文件接收完成: %s (%d 字节)", safe, got)
 }
 
-// sendFile pushes a local file to the connected peer at ip:port.
-func (a *app) sendFile(path, ip string, port int) error {
-	if !a.paired || a.key == nil {
-		return fmt.Errorf("请先配对")
+// ---------- outbound operations ----------
+
+func (a *app) dialPeer(ip string, port int) (net.Conn, *bufio.Reader, error) {
+	a.mu.Lock()
+	key := a.key
+	paired := a.paired
+	a.mu.Unlock()
+	if !paired || key == nil {
+		return nil, nil, fmt.Errorf("请先配对")
 	}
-	info, err := os.Stat(path)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 6*time.Second)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 5*time.Second)
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	r := bufio.NewReader(conn)
+	if err := mlp.WriteFrame(conn, mlp.TypeHello, a.helloJSON(), nil); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	t, _, err := mlp.ReadFrame(r, nil)
+	if err != nil || t != mlp.TypeHello {
+		conn.Close()
+		return nil, nil, fmt.Errorf("握手失败")
+	}
+	return conn, r, nil
+}
+
+func (a *app) sendClipText(ip string, port int, text string) error {
+	conn, _, err := a.dialPeer(ip, port)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	r := bufio.NewReader(conn)
-	mlp.WriteFrame(conn, mlp.TypeHello, a.helloJSON(), nil)
-	t, _, err := mlp.ReadFrame(r, nil)
-	if err != nil || t != mlp.TypeHello {
-		return fmt.Errorf("握手失败")
+	a.mu.Lock()
+	key := a.key
+	a.mu.Unlock()
+	if err := mlp.WriteFrame(conn, mlp.TypeClipText, []byte(text), key); err != nil {
+		return err
 	}
+	a.logf("已发送剪贴板文本到 %s (%d 字符)", ip, len(text))
+	return nil
+}
+
+func (a *app) sendFile(path, ip string, port int) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	conn, r, err := a.dialPeer(ip, port)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	a.mu.Lock()
+	key := a.key
+	a.mu.Unlock()
+
 	id := mlp.MakeID()
 	of, _ := json.Marshal(mlp.FileOffer{ID: id, Name: filepath.Base(path), Size: info.Size()})
-	_ = mlp.WriteFrame(conn, mlp.TypeFileOffer, of, a.key)
-	t, _, err = mlp.ReadFrame(r, a.key)
+	if err := mlp.WriteFrame(conn, mlp.TypeFileOffer, of, key); err != nil {
+		return err
+	}
+	t, _, err := mlp.ReadFrame(r, key)
 	if err != nil || t != mlp.TypeFileAck {
 		return fmt.Errorf("对端未接受文件")
 	}
+
+	a.mu.Lock()
+	a.transfers = append([]transferItem{{
+		ID: id, Name: filepath.Base(path), Size: info.Size(), Status: "发送中", Out: true,
+	}}, a.transfers...)
+	idx := 0
+	a.mu.Unlock()
+
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -336,173 +498,362 @@ func (a *app) sendFile(path, ip string, port int) error {
 	buf := make([]byte, 256<<10)
 	var offset int64
 	for {
-		n, err := f.Read(buf)
+		n, e := f.Read(buf)
 		if n > 0 {
 			chunk := make([]byte, 20+n)
-			// transfer id is 16 hex chars encoded as raw 16 bytes
-			copy(chunk[:16], []byte(id)[:16])
+			copy(chunk[:16], []byte(id))
 			chunk[16] = byte(offset >> 24)
 			chunk[17] = byte(offset >> 16)
 			chunk[18] = byte(offset >> 8)
 			chunk[19] = byte(offset)
 			copy(chunk[20:], buf[:n])
-			if e := mlp.WriteFrame(conn, mlp.TypeFileChunk, chunk, a.key); e != nil {
-				return e
+			if we := mlp.WriteFrame(conn, mlp.TypeFileChunk, chunk, key); we != nil {
+				return we
 			}
 			offset += int64(n)
+			a.mu.Lock()
+			if idx < len(a.transfers) {
+				a.transfers[idx].Got = offset
+				a.transfers[idx].Pct = float64(offset) / float64(info.Size()) * 100
+			}
+			a.mu.Unlock()
 		}
-		if err == io.EOF {
+		if e == io.EOF {
 			break
 		}
-		if err != nil {
-			return err
+		if e != nil {
+			return e
 		}
 	}
+	_, _, _ = mlp.ReadFrame(r, key) // FILE_DONE
+	a.mu.Lock()
+	if idx < len(a.transfers) {
+		a.transfers[idx].Status = "已完成"
+		a.transfers[idx].Pct = 100
+	}
+	a.mu.Unlock()
+	a.logf("文件发送完成: %s", filepath.Base(path))
 	return nil
 }
 
-func (a *app) setClipboard(text string) {
-	// Windows: use PowerShell Set-Clipboard (no external dependency).
-	ps := fmt.Sprintf("Set-Clipboard -Value %s", psQuote(text))
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", ps)
-	_ = cmd.Run()
+// Pair by actively connecting to a peer and sending a PAIR_REQ with our PIN.
+func (a *app) pairWithPeer(ip string, port int, pin string) error {
+	if len(pin) != 6 {
+		return fmt.Errorf("配对码必须是 6 位数字")
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 6*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	r := bufio.NewReader(conn)
+	_ = mlp.WriteFrame(conn, mlp.TypeHello, a.helloJSON(), nil)
+	t, pl, err := mlp.ReadFrame(r, nil)
+	if err != nil || t != mlp.TypeHello {
+		return fmt.Errorf("握手失败")
+	}
+	var hello mlp.Hello
+	_ = json.Unmarshal(pl, &hello)
+	req, _ := json.Marshal(mlp.PairReq{PIN: pin, ID: a.id, Name: a.name})
+	_ = mlp.WriteFrame(conn, mlp.TypePairReq, req, nil)
+	t, _, err = mlp.ReadFrame(r, nil)
+	if err != nil || t != mlp.TypePairResult {
+		return fmt.Errorf("未收到配对结果")
+	}
+	return a.pair(pin, hello.ID)
 }
 
-func psQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
+// ---------- relay mode ----------
 
-func showToast(title, text string) {
-	ps := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.NotifyIcon]::new() | Out-Null; $n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; $n.Visible=$true; $n.ShowBalloonTip(5000,%s,%s,[System.Windows.Forms.ToolTipIcon]::Info); Start-Sleep -Seconds 6; $n.Dispose()`, psQuote(title), psQuote(text))
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", ps)
-	_ = cmd.Run()
-}
-
-// relayMode connects to a relay room and bridges MLP frames over TCP.
-func (a *app) relayMode(relayAddr, room string) {
+func (a *app) relayLoop(addr, room string, stop <-chan struct{}) {
 	for {
-		conn, err := net.DialTimeout("tcp", relayAddr, 5*time.Second)
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err != nil {
-			a.mu.Lock()
-			a.status = "中继连接失败: " + err.Error()
-			a.mu.Unlock()
-			time.Sleep(5 * time.Second)
+			a.setStatus("中继连接失败: " + err.Error())
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Second):
+			}
 			continue
 		}
-		h := a.self()
+		h := a.hello()
 		h.Room = room
 		b, _ := json.Marshal(h)
 		_ = mlp.WriteFrame(conn, mlp.TypeHello, b, nil)
-		a.mu.Lock()
-		a.status = "已连接中继房间 " + room
-		a.mu.Unlock()
+		a.setStatus("已连接中继房间 " + room)
+		a.logf("已连接中继 %s 房间 %s", addr, room)
 		a.handleConn(conn)
-		time.Sleep(3 * time.Second)
+		select {
+		case <-stop:
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 }
 
-func (a *app) runWeb(addr string) {
-	http.HandleFunc("/", a.handleIndex)
-	http.HandleFunc("/api/state", a.handleState)
-	http.HandleFunc("/api/pair", a.handlePair)
-	http.HandleFunc("/api/clip/send", a.handleClipSend)
-	http.HandleFunc("/api/file/send", a.handleFileSend)
-	http.HandleFunc("/api/notify/list", a.handleNotifyList)
-	log.Printf("Web UI: http://%s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+// ---------- GUI ----------
+
+const (
+	cmdGenPin = iota + 2000
+	cmdPair
+	cmdSendClip
+	cmdSendFile
+	cmdOpenFolder
+	cmdClearNotify
+	cmdRefreshPeers
+	cmdRelayConnect
+	cmdCopyPin
+)
+
+func (a *app) buildUI(w *winui.Window) {
+	a.win = w
+
+	// Row 1: identity + pairing
+	w.Label("本机设备 ID:", 20, 86, 110, 26)
+	a.ctrlID = w.Label(a.id, 130, 86, 340, 26)
+	w.Label("配对码:", 490, 86, 70, 26)
+	a.ctrlPin = w.Edit("", 560, 82, 130, 30)
+	w.ButtonID(cmdGenPin, "🎲 生成", 700, 80, 90, 34)
+	w.ButtonID(cmdCopyPin, "📋 复制", 800, 80, 90, 34)
+
+	w.Label("首次使用：任一端生成 6 位配对码，两端填入相同配对码后点“配对”。", 20, 120, 860, 24)
+
+	// Peers list
+	w.Label("附近设备 / 已配对设备（点击选择）", 20, 156, 500, 26)
+	a.ctrlPeers = w.ListBox(20, 184, 560, 210)
+	w.ButtonID(cmdPair, "配对到选中设备", 600, 190, 280, 38)
+
+	// Status
+	w.Label("状态:", 20, 404, 60, 26)
+	a.ctrlStatus = w.Label("就绪", 80, 404, 800, 26)
+
+	// Actions
+	w.Label("操作（先选中设备）", 20, 440, 400, 26)
+	w.ButtonID(cmdSendClip, "📄 发送剪贴板文本", 20, 470, 200, 40)
+	w.ButtonID(cmdSendFile, "📎 发送文件", 230, 470, 180, 40)
+	w.ButtonID(cmdOpenFolder, "📂 打开接收目录", 420, 470, 200, 40)
+	w.ButtonID(cmdClearNotify, "🧹 清空通知", 630, 470, 160, 40)
+	w.ButtonID(cmdRefreshPeers, "🔄 重扫设备", 800, 470, 120, 40)
+
+	// Notifications
+	w.Label("手机通知（点击设备配对后自动同步）", 20, 524, 500, 26)
+	a.ctrlNotify = w.ListBox(20, 552, 560, 200)
+
+	// Log
+	w.Label("事件日志", 600, 524, 200, 26)
+	a.ctrlLog = w.MultiEdit(600, 552, 320, 200)
+
+	w.OnCommand = a.onCommand
+	w.OnTimer = a.refreshUI
 }
 
-func writeJSON(w http.ResponseWriter, v interface{}) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func (a *app) handleState(w http.ResponseWriter, r *http.Request) {
+func (a *app) refreshUI() {
+	if a.ctrlPeers == nil {
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Peers
+	selected := a.ctrlPeers.ListCurSel()
+	selectedID := ""
+	if selected >= 0 && selected < a.ctrlPeers.ListCount() {
+		selectedID = a.ctrlPeers.ListText(selected)
+	}
 	peers := make([]*peer, 0, len(a.peers))
 	for _, p := range a.peers {
 		peers = append(peers, p)
 	}
 	sort.Slice(peers, func(i, j int) bool { return peers[i].LastSeen > peers[j].LastSeen })
-	writeJSON(w, map[string]interface{}{
-		"id": a.id, "name": a.name, "paired": a.paired, "status": a.status,
-		"download": a.download, "peers": peers, "transfers": a.transfers,
-	})
+	a.ctrlPeers.ListClear()
+	peerLines := []string{}
+	for _, p := range peers {
+		line := fmt.Sprintf("%s | %s | %s:%d | %s", p.Name, p.Platform, p.IP, p.Port, p.ID)
+		peerLines = append(peerLines, line)
+		a.ctrlPeers.ListAdd(line)
+	}
+	if selectedID != "" {
+		for i, l := range peerLines {
+			if l == selectedID {
+				a.ctrlPeers.ListSetCurSel(i)
+				break
+			}
+		}
+	}
+
+	// Notifications
+	a.ctrlNotify.ListClear()
+	for _, n := range a.notifies {
+		a.ctrlNotify.ListAdd(fmt.Sprintf("[%s] %s: %s — %s",
+			time.Unix(n.TS, 0).Format("01-02 15:04"), n.App, n.Title, n.Text))
+	}
+
+	// Status
+	a.ctrlStatus.SetText(a.status)
+	a.ctrlID.SetText(a.id)
 }
 
-func (a *app) handlePair(w http.ResponseWriter, r *http.Request) {
-	pin := r.URL.Query().Get("pin")
-	id := r.URL.Query().Get("id")
-	_, err := a.pairFromUI(pin, id)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	writeJSON(w, map[string]interface{}{"ok": true})
-}
-
-func (a *app) handleClipSend(w http.ResponseWriter, r *http.Request) {
-	text := r.URL.Query().Get("text")
-	ip := r.URL.Query().Get("ip")
-	port := 47892
-	fmt.Sscanf(r.URL.Query().Get("port"), "%d", &port)
-	if !a.paired || a.key == nil {
-		http.Error(w, "请先配对", 400)
-		return
-	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 5*time.Second)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	defer conn.Close()
-	rr := bufio.NewReader(conn)
-	_ = mlp.WriteFrame(conn, mlp.TypeHello, a.helloJSON(), nil)
-	_, _, _ = mlp.ReadFrame(rr, nil)
-	_ = mlp.WriteFrame(conn, mlp.TypeClipText, []byte(text), a.key)
-	writeJSON(w, map[string]interface{}{"ok": true})
-}
-
-func (a *app) handleFileSend(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	ip := r.URL.Query().Get("ip")
-	port := 47892
-	fmt.Sscanf(r.URL.Query().Get("port"), "%d", &port)
-	if err := a.sendFile(path, ip, port); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	writeJSON(w, map[string]interface{}{"ok": true})
-}
-
-func (a *app) handleNotifyList(w http.ResponseWriter, r *http.Request) {
+func (a *app) selectedPeer() *peer {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	writeJSON(w, a.notifies)
+	w := a.win
+	_ = w
+	return nil
+}
+
+func (a *app) getSelectedPeer() (*peer, bool) {
+	i := a.ctrlPeers.ListCurSel()
+	if i < 0 {
+		return nil, false
+	}
+	line := a.ctrlPeers.ListText(i)
+	parts := strings.Split(line, " | ")
+	if len(parts) < 3 {
+		return nil, false
+	}
+	ipPort := parts[2]
+	ps := strings.Split(ipPort, ":")
+	if len(ps) < 2 {
+		return nil, false
+	}
+	port := mlp.DataPort
+	fmt.Sscanf(ps[len(ps)-1], "%d", &port)
+	var id string
+	if len(parts) >= 4 {
+		id = parts[3]
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if p, ok := a.peers[id]; ok {
+		return p, true
+	}
+	for _, p := range a.peers {
+		if p.IP == strings.Join(ps[:len(ps)-1], ":") {
+			return p, true
+		}
+	}
+	return &peer{IP: strings.Join(ps[:len(ps)-1], ":"), Port: port}, true
+}
+
+func (a *app) onCommand(id uintptr) {
+	switch id {
+	case cmdGenPin:
+		pin := mlp.MakePIN()
+		a.ctrlPin.SetText(pin)
+		a.mu.Lock()
+		a.pin = pin
+		a.mu.Unlock()
+		a.logf("生成配对码 %s（请在手机端输入相同码）", pin)
+		winui.MessageBox(a.win.H, "配对码已生成："+pin+"\n\n请在手机端输入相同配对码，然后点击“配对到选中设备”。",
+			"MoreLink 配对码", 0x40)
+
+	case cmdCopyPin:
+		pin := a.ctrlPin.Text()
+		if len(pin) == 6 {
+			_ = setClipboardWin(pin)
+			a.logf("已复制配对码到剪贴板")
+		}
+
+	case cmdPair:
+		p, ok := a.getSelectedPeer()
+		if !ok {
+			winui.MessageBox(a.win.H, "请先在列表中选择一个设备。", "提示", 0x30)
+			return
+		}
+		pin := a.ctrlPin.Text()
+		if len(pin) != 6 {
+			winui.MessageBox(a.win.H, "请先输入或生成 6 位配对码。", "提示", 0x30)
+			return
+		}
+		go func() {
+			if err := a.pairWithPeer(p.IP, p.Port, pin); err != nil {
+				a.logf("配对失败: %v", err)
+				a.setStatus("配对失败: " + err.Error())
+			} else {
+				a.setStatus("配对成功")
+			}
+		}()
+
+	case cmdSendClip:
+		p, ok := a.getSelectedPeer()
+		if !ok {
+			winui.MessageBox(a.win.H, "请先选择设备。", "提示", 0x30)
+			return
+		}
+		text := getClipboardWin()
+		if text == "" {
+			winui.MessageBox(a.win.H, "剪贴板为空，请先复制一段文本。", "提示", 0x30)
+			return
+		}
+		go func() {
+			if err := a.sendClipText(p.IP, p.Port, text); err != nil {
+				a.logf("发送剪贴板失败: %v", err)
+				a.setStatus("发送失败: " + err.Error())
+			}
+		}()
+
+	case cmdSendFile:
+		p, ok := a.getSelectedPeer()
+		if !ok {
+			winui.MessageBox(a.win.H, "请先选择设备。", "提示", 0x30)
+			return
+		}
+		path := winui.OpenFileDialog(a.win.H, "选择要发送的文件", "所有文件 (*.*)\x00*.*\x00")
+		if path == "" {
+			return
+		}
+		go func() {
+			if err := a.sendFile(path, p.IP, p.Port); err != nil {
+				a.logf("发送文件失败: %v", err)
+				a.setStatus("发送失败: " + err.Error())
+			}
+		}()
+
+	case cmdOpenFolder:
+		_ = os.MkdirAll(a.download, 0755)
+		winui.ShellOpen(a.download)
+
+	case cmdClearNotify:
+		a.mu.Lock()
+		a.notifies = nil
+		a.mu.Unlock()
+
+	case cmdRefreshPeers:
+		a.logf("重新扫描局域网设备…")
+	}
 }
 
 func main() {
-	webAddr := flag.String("web", "127.0.0.1:47890", "Web UI listen address")
-	tcpPort := flag.Int("port", mlp.DataPort, "MLP TCP port")
-	relayAddr := flag.String("relay", "", "relay address host:port (optional)")
-	room := flag.String("room", "", "relay room code")
+	dataPort := flag.Int("port", mlp.DataPort, "TCP 端口")
+	relayAddr := flag.String("relay", "", "中继地址 host:port（可选）")
+	room := flag.String("room", "", "中继房间码")
 	flag.Parse()
 
 	a := newApp()
-	a.mu.Lock()
-	a.status = "运行中"
-	a.mu.Unlock()
+	a.relayAddr = *relayAddr
+	a.room = *room
+	a.logf("MoreLink 启动 · 设备 ID %s", a.id)
 
-	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *tcpPort))
+	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *dataPort))
 	if err != nil {
-		log.Fatal(err)
+		winui.MessageBox(0, "端口 "+fmt.Sprint(*dataPort)+" 被占用:\n"+err.Error(), "MoreLink 错误", 0x10)
+		return
 	}
 	go a.serveTCP(ln)
-	go a.discoveryLoop(make(chan struct{}))
+	stop := make(chan struct{})
+	go a.discoveryLoop(stop)
 	if *relayAddr != "" && *room != "" {
-		go a.relayMode(*relayAddr, *room)
+		go a.relayLoop(*relayAddr, *room, stop)
 	}
-	log.Printf("MoreLink Windows  id=%s  name=%s", a.id, a.name)
-	a.runWeb(*webAddr)
+
+	w := winui.NewWindow("MoreLink · 跨设备协同中心 v2", 960, 800)
+	w.OnCreate = func() { a.buildUI(w) }
+	_ = w.Create()
 }

@@ -48,14 +48,15 @@ public final class Mlp {
 
     private Mlp() {}
 
-    /** SHA-256(PIN + ":" + min(idA,idB) + ":" + max(idA,idB)), order independent. */
+    /**
+     * v2: key depends ONLY on the shared PIN (domain-separated), so both peers
+     * always agree even if their stored device IDs differ. IDs are kept in the
+     * signature for compatibility with existing call sites.
+     */
     public static byte[] deriveKey(String pin, String idA, String idB) {
-        String lo, hi;
-        if (idA.compareTo(idB) <= 0) { lo = idA; hi = idB; }
-        else { lo = idB; hi = idA; }
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            return md.digest((pin + ":" + lo + ":" + hi).getBytes(StandardCharsets.UTF_8));
+            return md.digest(("MoreLink-v2|pin:" + pin).getBytes(StandardCharsets.UTF_8));
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
