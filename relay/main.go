@@ -187,5 +187,5 @@ func main() {
 	if *headless {
 		select {}
 	}
-	runGUI()
+	runGUIProtected()
 }

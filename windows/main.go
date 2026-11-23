@@ -831,6 +831,9 @@ func (a *app) onCommand(id uintptr) {
 }
 
 func main() {
+	defer winui.RecoverPanic()
+	winui.InitLog("client.log")
+
 	dataPort := flag.Int("port", mlp.DataPort, "TCP 端口")
 	relayAddr := flag.String("relay", "", "中继地址 host:port（可选）")
 	room := flag.String("room", "", "中继房间码")
@@ -853,7 +856,13 @@ func main() {
 		go a.relayLoop(*relayAddr, *room, stop)
 	}
 
+	winui.Logf("启动窗口 960x800，准备注册 Win32 窗口类")
 	w := winui.NewWindow("MoreLink · 跨设备协同中心 v2", 960, 800)
 	w.OnCreate = func() { a.buildUI(w) }
-	_ = w.Create()
+	winui.Logf("进入消息循环")
+	err = w.Create()
+	if err != nil {
+		winui.Logf("窗口创建失败: %v", err)
+	}
+	winui.Logf("消息循环结束，程序退出")
 }

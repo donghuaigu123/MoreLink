@@ -6,9 +6,58 @@
 package winui
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
+
+var (
+	logMu   sync.Mutex
+	logPath string
+	logOnce sync.Once
+)
+
+// InitLog enables writing diagnostics to a file next to the executable.
+// Call once at startup. Failures are ignored (GUI app has no console).
+func InitLog(name string) {
+	logOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, "MoreLink")
+		_ = os.MkdirAll(dir, 0755)
+		logPath = filepath.Join(dir, name)
+		Logf("==== %s 启动 %s ====", name, time.Now().Format("2006-01-02 15:04:05"))
+	})
+}
+
+// Logf appends a diagnostic line to the log file.
+func Logf(format string, args ...interface{}) {
+	if logPath == "" {
+		return
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// RecoverPanic should be deferred at the very top of main. Instead of a silent
+// crash (invisible in a GUI-subsystem exe), it logs the panic and shows a box.
+func RecoverPanic() {
+	if r := recover(); r != nil {
+		msg := fmt.Sprintf("程序遇到错误，已记录到日志。\n\n%v", r)
+		Logf("PANIC: %v", r)
+		MessageBox(0, msg, "MoreLink 错误", MB_ICONERROR)
+		time.Sleep(1500 * time.Millisecond)
+	}
+}
 
 var (
 	user32   = syscall.NewLazyDLL("user32.dll")
@@ -36,9 +85,12 @@ var (
 	pEndPaint           = user32.NewProc("EndPaint")
 	pFillRect           = user32.NewProc("FillRect")
 	pDrawText           = user32.NewProc("DrawTextW")
-	pSetBkMode          = user32.NewProc("SetBkMode")
-	pSetTextColor       = user32.NewProc("SetTextColor")
-	pSetBkColor         = user32.NewProc("SetBkColor")
+	// FIX: these three are GDI functions, NOT user32. Calling them through
+	// user32 caused an immediate panic in WM_PAINT, which silently killed the
+	// GUI process (no console) — the true root cause of "won't open".
+	pSetBkMode          = gdi32.NewProc("SetBkMode")
+	pSetTextColor       = gdi32.NewProc("SetTextColor")
+	pSetBkColor         = gdi32.NewProc("SetBkColor")
 	pCreateSolidBrush   = gdi32.NewProc("CreateSolidBrush")
 	pDeleteObject       = gdi32.NewProc("DeleteObject")
 	pSelectObject       = gdi32.NewProc("SelectObject")
@@ -364,6 +416,11 @@ func (w *Window) Create() error {
 func (w *Window) proc(hwnd HWND, msg uint32, wp, lp uintptr) uintptr {
 	switch msg {
 	case WM_CREATE:
+		// CRITICAL FIX: WM_CREATE is dispatched synchronously from inside
+		// CreateWindowEx, BEFORE Create() assigns w.H. All child controls
+		// created in OnCreate use w.H as parent; without this they get parent=0
+		// and fail to appear (blank window). Use the hwnd passed to the proc.
+		w.H = hwnd
 		pSetTimer.Call(uintptr(hwnd), 1, 400, 0)
 		if w.OnCreate != nil {
 			w.OnCreate()

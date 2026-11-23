@@ -2,6 +2,12 @@
 
 **跨设备协同 · 局域网 / 远程 · 端到端加密 · 100% 原创开源**
 
+> **v2.1.0 关键修复（Windows 程序打不开问题）**
+> - ✅ **修复致命崩溃**：`SetBkMode`/`SetTextColor`/`SetBkColor` 是 GDI 函数却被错误地从 `user32.dll` 加载，导致窗口一绘制（WM_PAINT）就 panic，GUI 程序无控制台 → 静默退出，表现为"打不开/双击没反应"。现已改为 `gdi32.dll`。
+> - ✅ **修复空白窗口**：`WM_CREATE` 回调创建控件时窗口句柄 `w.H` 尚未赋值（仍为 0），导致全部子控件创建失败、窗口空白。现改为在消息处理中用回调传入的 `hwnd` 先赋值再建控件。
+> - ✅ **新增崩溃日志与弹窗**：任何 panic 不再静默退出，会写入 `~/MoreLink/client.log` 或 `relay.log` 并弹出错误框。
+> - ✅ 已用 Wine + Xvfb 真实验证：Windows 客户端与中继窗口均正常渲染，按钮点击→配对码弹窗交互链路测试通过。
+>
 > **v2.0.0 重大更新（彻底重写）**
 > - ✅ Windows 端改为**原生 Win32 可视化窗口**（不再是黑色控制台，无需浏览器，兼容 Windows 7）
 > - ✅ 中继服务器也提供**原生 GUI 状态窗口**
@@ -42,7 +48,7 @@ Android App (Java)          Windows App (Go)
 
 - **协议规范**：[`protocol/PROTOCOL.md`](protocol/PROTOCOL.md)
 - **共享 Go 协议库**：[`internal/mlp/`](internal/mlp/)（含单元测试）
-- **Windows 客户端**：[`windows/`](windows/) — Go 编写，内嵌本地 Web UI（`http://127.0.0.1:47890`）
+- **Windows 客户端**：[`windows/`](windows/) — Go 编写，原生 Win32 GUI 窗口（GUI 组件在 [`winui/`](winui/)）
 - **Android 客户端**：[`android/`](android/) — Java，纯 Android Framework API
 - **中继服务器**：[`relay/`](relay/) — Go，用于跨网络
 
@@ -70,19 +76,23 @@ Android App (Java)          Windows App (Go)
 
 ### 2. 发送剪贴板文本
 
-- **手机 → 电脑**：App 中填电脑 IP 和文本，点「发送文本到电脑」。
-- **电脑 → 手机**：Web UI「发送剪贴板文本」区填入手机 IP 和文本，点「发送到对端」。
+- **手机 → 电脑**：App 中填电脑 IP 和文本，点「发送文本」。
+- **电脑 → 手机**：先在设备列表选中手机，复制好文本后点 Windows 窗口的「📄 发送剪贴板文本」。
 
 ### 3. 发送文件
 
-- **电脑 → 手机**：Web UI「发送文件」区填手机 IP 和文件完整路径，点「发送文件」。
+- **电脑 → 手机**：在设备列表选中手机，点「📎 发送文件」，在文件对话框中选择文件。
   - 手机接收目录：`Android/data/com.morelink.app/files/Received/`
-- **手机 → 电脑**：（在手机端文件选择器中选择文件后发送；接收目录为 Windows 用户目录下的 `MoreLink/Received/`）
+- **手机 → 电脑**：App 中点「选择文件发送到电脑」；接收目录为 Windows 用户目录下的 `MoreLink/Received/`（可用「📂 打开接收目录」直接打开）。
 
 ### 4. 通知同步
 
 1. Android 端点「开启通知读取权限」，在系统设置中授予 MoreLink 通知使用权。
-2. 配对后，手机收到的通知会实时显示在 Windows Web UI 的「手机通知」区，并弹出系统气泡通知。
+2. 配对后，手机收到的通知会实时显示在 Windows 窗口的「手机通知」列表区。
+
+### 5. 故障排查
+
+程序遇到任何错误会写入日志：`%USERPROFILE%\MoreLink\client.log`（客户端）、`relay.log`（中继），并弹出错误提示框。若窗口空白或按钮无响应，请先查看该日志。
 
 ### 5. 跨网络远程（中继模式）
 
