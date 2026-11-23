@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MoreLink" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">#0F1420</item>
+        <item name="android:colorAccent">#6EE7B7</item>
+        <item name="android:windowBackground">#0F1420</item>
+        <item name="android:textColorPrimary">#E6EDF7</item>
+    </style>
+</resources>

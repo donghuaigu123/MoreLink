@@ -1,0 +1,127 @@
+# MoreLink
+
+**跨设备协同 · 局域网 / 远程 · 端到端加密 · 100% 原创开源**
+
+MoreLink 是一个由本人从零编写的开源项目，让 Android 手机与 Windows 电脑像一台设备一样协同工作。它参考了同类软件的**功能理念**（文件互传、剪贴板共享、通知同步），但**没有复制任何第三方项目的代码**。所有协议、加密、客户端均为原创实现。
+
+> ⚠️ 本项目名称 MoreLink 与 logo 均为原创，与任何其他项目无关联。
+
+## 功能
+
+| 功能 | Android | Windows | 说明 |
+|---|:---:|:---:|---|
+| 局域网自动发现 | ✅ | ✅ | UDP 广播，无需配置 |
+| 端到端加密 | ✅ | ✅ | AES-256-GCM，密钥由配对码派生 |
+| 配对 | ✅ | ✅ | 6 位配对码 |
+| 剪贴板文本互传 | ✅ | ✅ | 一端复制，另一端粘贴 |
+| 文件互传 | ✅ | ✅ | 256 KiB 分块，SHA-256 校验 |
+| 通知同步 | ✅ 发送 | ✅ 接收 | 手机通知实时显示在电脑 |
+| 远程模式 | ✅ | ✅ | 通过自建中继服务器跨网络连接 |
+
+## 架构
+
+```
+Android App (Java)          Windows App (Go)
+      │                           │
+      └──── MoreLink Protocol ────┘
+             v1 (原创)
+   明文握手 → 6 位 PIN 配对 → AES-256-GCM 加密帧
+              │
+      ┌───────┴───────┐
+   局域网直连      中继服务器 (Go)
+   UDP 发现 + TCP   TCP 房间码转发
+```
+
+- **协议规范**：[`protocol/PROTOCOL.md`](protocol/PROTOCOL.md)
+- **共享 Go 协议库**：[`internal/mlp/`](internal/mlp/)（含单元测试）
+- **Windows 客户端**：[`windows/`](windows/) — Go 编写，内嵌本地 Web UI（`http://127.0.0.1:47890`）
+- **Android 客户端**：[`android/`](android/) — Java，纯 Android Framework API
+- **中继服务器**：[`relay/`](relay/) — Go，用于跨网络
+
+## 下载 / 构建产物
+
+构建产物放在 [`dist/`](dist/) 目录：
+
+- `MoreLink-Windows.exe` — Windows x64 客户端（单文件，无需安装）
+- `MoreLink-Android.apk` — Android 客户端（minSdk 26 / Android 8.0+）
+- `morelink-relay.exe` — Windows 版中继服务器
+- `morelink-relay-linux` — Linux 版中继服务器
+
+## 快速开始
+
+### 1. 局域网使用
+
+1. 两端安装 MoreLink，确保在同一 Wi-Fi / 局域网。
+2. **Windows**：双击 `MoreLink-Windows.exe`，浏览器自动打开（或手动访问 `http://127.0.0.1:47890`）。
+3. **Android**：打开 App，点「启动 / 保持后台运行」，并授予通知读取权限。
+4. **配对**：
+   - 在 Android 端点「生成配对码」，记住 6 位数字；
+   - 在 Windows Web UI 的「配对」区填入该配对码，点「确认配对」；
+   - 手机设备 ID 可留空（配对任意请求设备）。
+5. 配对完成后，「附近设备」会列出对端，点「选用」自动填入 IP。
+
+### 2. 发送剪贴板文本
+
+- **手机 → 电脑**：App 中填电脑 IP 和文本，点「发送文本到电脑」。
+- **电脑 → 手机**：Web UI「发送剪贴板文本」区填入手机 IP 和文本，点「发送到对端」。
+
+### 3. 发送文件
+
+- **电脑 → 手机**：Web UI「发送文件」区填手机 IP 和文件完整路径，点「发送文件」。
+  - 手机接收目录：`Android/data/com.morelink.app/files/Received/`
+- **手机 → 电脑**：（在手机端文件选择器中选择文件后发送；接收目录为 Windows 用户目录下的 `MoreLink/Received/`）
+
+### 4. 通知同步
+
+1. Android 端点「开启通知读取权限」，在系统设置中授予 MoreLink 通知使用权。
+2. 配对后，手机收到的通知会实时显示在 Windows Web UI 的「手机通知」区，并弹出系统气泡通知。
+
+### 5. 跨网络远程（中继模式）
+
+1. 在有公网 IP 的服务器上运行中继：
+   ```bash
+   # Linux
+   ./morelink-relay-linux -listen :47893
+   # Windows
+   morelink-relay.exe -listen :47893
+   ```
+2. Windows 客户端：
+   ```
+   MoreLink-Windows.exe -relay 1.2.3.4:47893 -room myroom123
+   ```
+3. Android 客户端：在设置中填入中继地址和相同房间码（功能入口见 App）。
+4. 中继只做透明字节转发，无法解密内容（端到端密钥不经过中继）。
+
+## 从源码构建
+
+### Windows / 中继 / 协议测试（Go 1.21+）
+
+```bash
+go test ./...                                             # 运行协议一致性测试
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/MoreLink-Windows.exe ./windows
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/morelink-relay.exe ./relay
+```
+
+### Android APK（JDK 17 + Android SDK 34）
+
+```bash
+cd android
+./gradlew assembleDebug
+# 产物: app/build/outputs/apk/debug/app-debug.apk
+```
+
+## 安全说明
+
+- 配对码是唯一共享密钥材料，建议使用随机 6 位数并仅在可信设备间交换。
+- 中继服务器只转发密文，但知道房间码的人可以尝试连接；请为房间码设置足够长度和随机性。
+- 本软件定位为个人/小团队工具，未经专业安全审计，请勿用于高敏感场景。
+
+## 许可证
+
+本项目采用 **MIT License** — 详见 [`LICENSE`](LICENSE)。
+
+> 本项目为原创作品，仅参考了同类软件的功能列表，未使用其任何源代码、商标或素材。
+
+## 致谢
+
+感谢所有开源社区让跨设备协同成为可能。MoreLink 是独立实现，与任何商业或开源项目无隶属关系。

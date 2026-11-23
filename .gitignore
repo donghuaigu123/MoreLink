@@ -1,0 +1,21 @@
+# Go
+dist/
+*.exe
+*.test
+*.out
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+.DS_Store
+
+# Java
+*.class
+
+# IDE
+.vscode/
+.idea/
