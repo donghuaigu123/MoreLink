@@ -2,6 +2,13 @@
 
 **跨设备协同 · 局域网 / 远程 · 端到端加密 · 100% 原创开源**
 
+![MoreLink 主图标](assets/icons/morelink-512.png)
+
+> **v2.4.0 统一品牌图标**
+> - ✅ **全端统一图标**：Windows 客户端、Android App、中继服务器采用同一套原创「互联」品牌标识——深色圆角底上，青绿手机与天蓝电脑由发光链路相连，象征跨设备互联；配色与高对比度深色 UI 一致。
+> - ✅ **中继专属图标**：中继程序在相同构图上加入醒目的橙黄色「中继枢纽」圆环与双向箭头，体现「中转/桥接」语义，与主图标统一但可一眼区分。
+> - ✅ 三端图标均已实机验证：Windows exe 内嵌图标资源（资源管理器/标题栏/托盘可见），Android 覆盖全密度 mipmap，中继 GUI 无 panic。
+
 > **v2.3.0 连接信息可视化与安卓保存目录**
 > - ✅ **中继服务器显示连接信息**：中继窗口顶部醒目展示「服务器地址:端口 / 房间码 / 配对码」，每项一键复制，还有「复制全部」和「重新生成」按钮；可填公网 IP/域名适配跨网络。headless 模式也在启动时打印同样信息。**两端客户端照着填即可连接，真正傻瓜式操作。**
 > - ✅ **Android 保存目录自定义**：App「④ 文件互传」新增「选择保存目录」按钮，通过系统目录选择器（SAF）选取任意文件夹并持久化授权，接收文件保存到该目录；「重置为默认」可恢复。
@@ -63,12 +70,13 @@ Android App (Java)          Windows App (Go)
 - **Windows 客户端**：[`windows/`](windows/) — Go 编写，原生 Win32 GUI 窗口（GUI 组件在 [`winui/`](winui/)）
 - **Android 客户端**：[`android/`](android/) — Java，纯 Android Framework API
 - **中继服务器**：[`relay/`](relay/) — Go，用于跨网络
+- **品牌图标**：[`assets/icons/`](assets/icons/) — 统一互联标识与中继变体（PNG/ICO/syso），生成脚本 `generate_icons.py`
 
 ## 下载 / 构建产物
 
 **请从 [Releases 页面](https://github.com/donghuaigu123/MoreLink/releases) 下载最新构建产物**（二进制不存入 git 仓库，以减小仓库体积）：
 
-- 最新稳定版：[v2.3.0](https://github.com/donghuaigu123/MoreLink/releases/tag/v2.3.0)
+- 最新稳定版：[v2.4.0](https://github.com/donghuaigu123/MoreLink/releases/tag/v2.4.0)
 
 各版本包含：
 

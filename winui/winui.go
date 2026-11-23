@@ -134,6 +134,10 @@ const (
 	WM_DRAWITEM        = 0x002B
 	WM_NOTIFY          = 0x004E
 	WM_LBUTTONDOWN     = 0x0201
+	WM_SETICON         = 0x0080
+
+	ICON_SMALL = 0
+	ICON_BIG   = 1
 
 	BN_CLICKED = 0
 
@@ -414,6 +418,14 @@ func (w *Window) Create() error {
 		return err
 	}
 	w.H = HWND(h)
+
+	// Use the application icon embedded as resource ID 1 (falls back silently
+	// to the default if none is present). This sets both the title-bar icon
+	// and the Alt+Tab / Explorer icon.
+	if hi, _, _ := pLoadIcon.Call(uintptr(hinst), 1); hi != 0 {
+		pSendMessage.Call(uintptr(h), WM_SETICON, ICON_SMALL, hi)
+		pSendMessage.Call(uintptr(h), WM_SETICON, ICON_BIG, hi)
+	}
 
 	pShowWindow.Call(uintptr(h), SW_SHOW)
 	pUpdateWindow.Call(uintptr(h))

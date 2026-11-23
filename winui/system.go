@@ -81,7 +81,13 @@ const (
 var trayIconHandle syscall.Handle
 
 func notifyIcon(hwnd HWND, action uint32, tip string) bool {
-	hi, _, _ := pLoadIcon.Call(0, IDI_APPLICATION)
+	// Prefer the app icon embedded as resource ID 1; fall back to the system
+	// application icon when the binary has no custom icon resource.
+	hinst, _, _ := pGetModuleHandle.Call(0)
+	hi, _, _ := pLoadIcon.Call(hinst, 1)
+	if hi == 0 {
+		hi, _, _ = pLoadIcon.Call(0, IDI_APPLICATION)
+	}
 	trayIconHandle = syscall.Handle(hi)
 	n := NOTIFYICONDATAA{
 		CbSize:          uint32(unsafe.Sizeof(NOTIFYICONDATAA{})),
