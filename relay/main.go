@@ -6,17 +6,152 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/donghuaigu123/MoreLink/internal/mlp"
 )
+
+// Connection info that clients need in order to join this relay. The relay
+// generates a ready-to-use room code and pairing PIN and prints/shows them so
+// users can simply copy the three values into both apps (" foolproof" setup).
+type connectionInfo struct {
+	mu        sync.Mutex
+	room      string // human-friendly room code, e.g. ML-7K3Q2W
+	pin       string // 6-digit pairing PIN shared by both clients
+	listen    string // raw listen address, e.g. :47893
+	public    string // externally advertised host:port (LAN IP or public IP/domain)
+	interfaces []string
+}
+
+var ci = &connectionInfo{}
+
+var rePort = regexp.MustCompile(`:(\d+)$`)
+
+func listenPort(addr string) int {
+	if m := rePort.FindStringSubmatch(addr); m != nil {
+		var p int
+		if _, err := fmt.Sscanf(m[1], "%d", &p); err == nil && p > 0 {
+			return p
+		}
+	}
+	return mlp.RelayPort
+}
+
+// localIPv4 returns all non-loopback IPv4 addresses of this machine.
+func localIPv4() []string {
+	var out []string
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return out
+	}
+	for _, i := range ifs {
+		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok {
+				if ip4 := ipnet.IP.To4(); ip4 != nil {
+					out = append(out, ip4.String())
+				}
+			}
+		}
+	}
+	return out
+}
+
+// genRoomCode makes a short, unambiguous room code (no 0/O/1/I/l).
+func genRoomCode() string {
+	const alpha = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		// Extremely unlikely; fall back to a time-based value so the code is
+		// never empty/constant even on a system without a CSPRNG.
+		n := time.Now().UnixNano()
+		for i := range b {
+			b[i] = byte(n >> (uint(i) * 8))
+		}
+	}
+	out := make([]byte, len(b))
+	for i, v := range b {
+		out[i] = alpha[int(v)%len(alpha)]
+	}
+	return "ML-" + string(out)
+}
+
+// initConnection prepares a fresh room + PIN and detects LAN addresses.
+func initConnection(listen string) {
+	ci.mu.Lock()
+	ci.room = genRoomCode()
+	ci.pin = mlp.MakePIN()
+	ci.listen = listen
+	ci.interfaces = localIPv4()
+	port := listenPort(listen)
+	host := "127.0.0.1"
+	if len(ci.interfaces) > 0 {
+		host = ci.interfaces[0]
+	}
+	ci.public = fmt.Sprintf("%s:%d", host, port)
+	ci.mu.Unlock()
+}
+
+// regenerateCodes creates a new room code and PIN (addresses stay the same).
+func regenerateCodes() (string, string) {
+	ci.mu.Lock()
+	ci.room = genRoomCode()
+	ci.pin = mlp.MakePIN()
+	room, pin := ci.room, ci.pin
+	ci.mu.Unlock()
+	addLine(fmt.Sprintf("已生成新的连接信息：房间 %s  配对码 %s", room, pin))
+	return room, pin
+}
+
+// setPublicHost lets the user override the advertised address (public IP/domain).
+func setPublicHost(host string) string {
+	ci.mu.Lock()
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := listenPort(ci.listen)
+	// If the user typed host:port, keep as-is; otherwise append our port.
+	if rePort.MatchString(host) {
+		ci.public = host
+	} else {
+		ci.public = fmt.Sprintf("%s:%d", host, port)
+	}
+	pub := ci.public
+	ci.mu.Unlock()
+	return pub
+}
+
+// connInfoText returns a copy-paste block with everything both clients need.
+func connInfoText() (room, pin, public string, ifaces []string) {
+	ci.mu.Lock()
+	defer ci.mu.Unlock()
+	return ci.room, ci.pin, ci.public, append([]string(nil), ci.interfaces...)
+}
+
+func printConnInfo() {
+	room, pin, pub, ifaces := connInfoText()
+	fmt.Println("========== MoreLink 中继连接信息 ==========")
+	fmt.Printf("服务器地址:端口 : %s\n", pub)
+	if len(ifaces) > 1 {
+		fmt.Printf("本机其它地址     : %v\n", ifaces[1:])
+	}
+	fmt.Printf("房间码           : %s\n", room)
+	fmt.Printf("配对码           : %s\n", pin)
+	fmt.Println("两端客户端填入以上相同的地址/房间码/配对码即可连接")
+	fmt.Println("==========================================")
+}
 
 type client struct {
 	conn net.Conn
@@ -225,6 +360,11 @@ func startServer(listenAddr string) error {
 	st.running = true
 	st.mu.Unlock()
 	addLine("中继服务器已启动，监听 " + listenAddr)
+	if ci.room == "" {
+		initConnection(listenAddr)
+	}
+	room, pin, pub, _ := connInfoText()
+	addLine(fmt.Sprintf("连接信息 → 地址 %s | 房间码 %s | 配对码 %s", pub, room, pin))
 	go func(l net.Listener, stop chan struct{}) {
 		for {
 			c, err := l.Accept()
@@ -264,10 +404,12 @@ func main() {
 	headless := flag.Bool("headless", false, "无界面模式")
 	flag.Parse()
 
+	initConnection(*listen)
 	if err := startServer(*listen); err != nil {
 		addLine("监听失败: " + err.Error())
 	}
 	if *headless {
+		printConnInfo()
 		select {}
 	}
 	runGUIProtected()

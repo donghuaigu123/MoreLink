@@ -603,6 +603,22 @@ func (w *Window) ListBox(x, y, width, height int) *Control {
 	return w.createCtrl("LISTBOX", "", LBS_STANDARD|WS_VSCROLL, x, y, width, height, 0)
 }
 
+// Line draws a thin horizontal separator using a disabled static frame.
+func Line(parent HWND, x, y, width, height int, color uintptr) *Control {
+	if height < 1 {
+		height = 1
+	}
+	h, _, _ := pCreateWindowEx.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16("STATIC"))),
+		0,
+		uintptr(WS_CHILD|WS_VISIBLE|SS_LEFT),
+		uintptr(x), uintptr(y), uintptr(width), uintptr(height),
+		uintptr(parent), 0, 0, 0,
+	)
+	return &Control{H: HWND(h)}
+}
+
 // Checkbox creates an auto checkbox control.
 func (w *Window) Checkbox(text string, x, y, width, height int) *Control {
 	return w.createCtrl("BUTTON", text, BS_AUTOCHECKBOX|WS_TABSTOP, x, y, width, height, 0)

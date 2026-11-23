@@ -39,6 +39,7 @@ import java.io.InputStream;
 /** Main UI: high-contrast dark theme, pairing, peers, clipboard, files, permissions. */
 public class MainActivity extends Activity {
     private static final int REQ_PICK_FILE = 42;
+    private static final int REQ_PICK_DIR = 43;
     private static final int BG = 0xFF0F1420;
     private static final int PANEL = 0xFF1A2438;
     private static final int ACCENT = 0xFF6EE7B7;
@@ -46,7 +47,7 @@ public class MainActivity extends Activity {
     private static final int TEXT = 0xFFE6EDF7;
     private static final int MUTED = 0xFF9FB0C8;
 
-    private TextView statusView, peersView, infoView, logView;
+    private TextView statusView, peersView, infoView, logView, dirView;
     private EditText pinEdit, targetIpEdit, clipEdit;
     private EditText relayHostEdit, relayPortEdit, relayRoomEdit, relayPinEdit;
 
@@ -123,21 +124,21 @@ public class MainActivity extends Activity {
 
         root.addView(section("④ 文件互传"));
         root.addView(button("选择文件发送到电脑", v -> pickFile()));
-        TextView fhint = new TextView(this);
         SharedPreferences sp0 = getSharedPreferences(LinkService.PREFS, MODE_PRIVATE);
-        String recvDir = getExternalFilesDir(null) + "/Received";
-        fhint.setText("接收文件保存在:\n" + recvDir + "\n（可在下方“接收目录”中查看/另存）");
-        fhint.setTextColor(MUTED);
-        fhint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        root.addView(fhint);
-        root.addView(button("查看接收目录", v -> {
-            android.net.Uri uri = android.net.Uri.parse("content://com.morelink.app.files/" + recvDir);
-            try {
-                Intent i = new Intent(Intent.ACTION_VIEW);
-                i.setDataAndType(uri, "resource/folder");
-                startActivity(i);
-            } catch (Exception e) { toast("接收目录: " + recvDir); }
+        dirView = new TextView(this);
+        dirView.setTextColor(MUTED);
+        dirView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        dirView.setText("接收文件保存到:\n" + LinkService.receiveDirLabel(this));
+        root.addView(card(dirView, ""));
+        LinearLayout dirRow = row();
+        dirRow.addView(button("选择保存目录", v -> pickSaveDir()));
+        dirRow.addView(button("重置为默认", v -> {
+            getSharedPreferences(LinkService.PREFS, MODE_PRIVATE).edit()
+                    .remove(LinkService.KEY_RECV_TREE).apply();
+            dirView.setText("接收文件保存到:\n" + LinkService.receiveDirLabel(this));
+            toast("已恢复默认保存目录");
         }));
+        root.addView(dirRow);
 
         root.addView(section("⑤ 跨网络中继（无公网IP时）"));
         relayHostEdit = edit("中继服务器地址（域名或IP）");
@@ -186,7 +187,7 @@ public class MainActivity extends Activity {
         root.addView(card(logView, ""));
 
         TextView foot = new TextView(this);
-        foot.setText("MoreLink v2.0.0 · 原创开源 · 端到端 AES-256-GCM 加密\n局域网自动发现 + 可选中继跨网络");
+        foot.setText("MoreLink v2.3.0 · 原创开源 · 端到端 AES-256-GCM 加密\n局域网自动发现 + 可选中继跨网络 + 自定义保存目录");
         foot.setTextColor(MUTED);
         foot.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         foot.setGravity(Gravity.CENTER);
@@ -308,9 +309,31 @@ public class MainActivity extends Activity {
         catch (Exception e) { toast("无法打开选择器"); }
     }
 
+    private void pickSaveDir() {
+        try {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            startActivityForResult(i, REQ_PICK_DIR);
+        } catch (Exception e) { toast("此设备不支持目录选择，将使用默认目录"); }
+    }
+
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if (req == REQ_PICK_DIR && res == RESULT_OK && data != null && data.getData() != null) {
+            Uri tree = data.getData();
+            try {
+                int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(tree, flags);
+                getSharedPreferences(LinkService.PREFS, MODE_PRIVATE).edit()
+                        .putString(LinkService.KEY_RECV_TREE, tree.toString()).apply();
+                toast("保存目录已设置");
+            } catch (Exception e) { toast("无法保存目录授权"); }
+            refresh();
+            return;
+        }
         if (req == REQ_PICK_FILE && res == RESULT_OK && data != null && data.getData() != null) {
             Uri uri = data.getData();
             final String name = queryName(uri);
@@ -395,6 +418,7 @@ public class MainActivity extends Activity {
 
     private void refresh() {
         if (statusView == null) return;
+        if (dirView != null) dirView.setText("接收文件保存到:\n" + LinkService.receiveDirLabel(this));
         String json = LinkService.stateJson(this);
         try {
             JSONObject o = new JSONObject(json);

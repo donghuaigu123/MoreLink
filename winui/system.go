@@ -13,8 +13,17 @@ import (
 var (
 	shell32  = syscall.NewLazyDLL("shell32.dll")
 	advapi32 = syscall.NewLazyDLL("advapi32.dll")
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 
 	pShellNotifyIcon     = shell32.NewProc("Shell_NotifyIconW")
+	pOpenClipboard       = user32.NewProc("OpenClipboard")
+	pCloseClipboard      = user32.NewProc("CloseClipboard")
+	pEmptyClipboard      = user32.NewProc("EmptyClipboard")
+	pSetClipboardData    = user32.NewProc("SetClipboardData")
+	pGlobalAlloc         = kernel32.NewProc("GlobalAlloc")
+	pGlobalLock          = kernel32.NewProc("GlobalLock")
+	pGlobalUnlock        = kernel32.NewProc("GlobalUnlock")
+	pCopyMemory          = kernel32.NewProc("RtlMoveMemory")
 	pRegOpenKeyEx        = advapi32.NewProc("RegOpenKeyExW")
 	pRegSetValueEx       = advapi32.NewProc("RegSetValueExW")
 	pRegQueryValue       = advapi32.NewProc("RegQueryValueExW")
@@ -231,6 +240,38 @@ func SelectFolder(owner HWND, title string) string {
 		return syscall.UTF16ToString(pathBuf)
 	}
 	return ""
+}
+
+// ---- Clipboard ----
+
+const (
+	CF_UNICODETEXT = 13
+	GMEM_MOVEABLE  = 0x0002
+)
+
+// SetClipboard places UTF-16 text on the Windows clipboard (works on Win7).
+func SetClipboard(text string) {
+	u, err := syscall.UTF16FromString(text)
+	if err != nil {
+		return
+	}
+	bytes := len(u) * 2
+	hMem, _, _ := pGlobalAlloc.Call(GMEM_MOVEABLE, uintptr(bytes))
+	if hMem == 0 {
+		return
+	}
+	ptr, _, _ := pGlobalLock.Call(hMem)
+	if ptr == 0 {
+		return
+	}
+	pCopyMemory.Call(ptr, uintptr(unsafe.Pointer(&u[0])), uintptr(bytes))
+	_, _, _ = pGlobalUnlock.Call(hMem)
+	if r, _, _ := pOpenClipboard.Call(0); r == 0 {
+		return
+	}
+	_, _, _ = pEmptyClipboard.Call()
+	_, _, _ = pSetClipboardData.Call(CF_UNICODETEXT, hMem)
+	_, _, _ = pCloseClipboard.Call()
 }
 
 // ---- helpers ----

@@ -9,8 +9,10 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.os.Build;
 import android.os.IBinder;
+import android.provider.DocumentsContract;
 import android.util.Log;
 
 import java.io.BufferedInputStream;
@@ -58,10 +60,56 @@ public class LinkService extends Service {
         String name;
         long size;
         long got;
-        java.io.FileOutputStream fos;
+        OutputStream fos;
         java.security.MessageDigest digest;
     }
     private static volatile RelayRecv relayRecv;
+
+    // ---- Receive directory (SAF tree URI chosen by the user) ----
+    public static final String KEY_RECV_TREE = "recv_tree_uri";
+
+    /** Returns a human-readable label of the current receive directory. */
+    public static String receiveDirLabel(Context c) {
+        SharedPreferences p = c.getSharedPreferences(PREFS, MODE_PRIVATE);
+        String tree = p.getString(KEY_RECV_TREE, "");
+        if (!tree.isEmpty()) {
+            try {
+                Uri u = Uri.parse(tree);
+                String id = DocumentsContract.getTreeDocumentId(u);
+                if (id != null) {
+                    int colon = id.indexOf(':');
+                    return (colon >= 0 ? id.substring(colon + 1) : id) + "（自定义）";
+                }
+            } catch (Exception ignored) {}
+        }
+        File dir = new File(c.getExternalFilesDir(null), "Received");
+        return dir.getAbsolutePath() + "（默认）";
+    }
+
+    /** Opens an OutputStream for a received file in the configured directory. */
+    private OutputStream openReceiveStream(String name) throws IOException {
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String tree = p.getString(KEY_RECV_TREE, "");
+        if (!tree.isEmpty()) {
+            try {
+                Uri treeUri = Uri.parse(tree);
+                String docId = DocumentsContract.getTreeDocumentId(treeUri);
+                Uri parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
+                // createDocument may reject an existing name; add a suffix to avoid clobbering.
+                Uri doc = DocumentsContract.createDocument(getContentResolver(), parent,
+                        "application/octet-stream", name);
+                if (doc != null) {
+                    OutputStream os = getContentResolver().openOutputStream(doc, "w");
+                    if (os != null) return os;
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "openReceiveStream SAF: " + e.getMessage());
+            }
+        }
+        File dir = new File(getExternalFilesDir(null), "Received");
+        if (!dir.exists()) dir.mkdirs();
+        return new FileOutputStream(new File(dir, name));
+    }
 
     private String myId;
     private String myName;
@@ -145,9 +193,18 @@ public class LinkService extends Service {
                 helloJson = helloJson.substring(0, helloJson.length() - 1) + ",\"room\":\"" +
                         Mlp.jsonEscape(room) + "\"}";
                 Mlp.writeFrame(os, Mlp.TYPE_HELLO, Mlp.utf8(helloJson), null);
-                // Second HELLO travels transparently to the peer.
+                // Second HELLO travels transparently to the peer, and we must
+                // read the peer's second (plaintext) HELLO before encrypted
+                // frames start. The Windows client does send+read of this
+                // HELLO inside handleConn; skipping the read here caused the
+                // plaintext HELLO to be decrypted as ciphertext -> relay kept
+                // reconnecting and never worked. Keep both sides symmetric.
                 Mlp.writeFrame(os, Mlp.TYPE_HELLO,
                         Mlp.utf8(Mlp.helloJson(myId, myName, "android", Mlp.DATA_PORT)), null);
+                byte[] peerHello = Mlp.readFrame(is, null);
+                if (peerHello == null || Mlp.frameType(peerHello) != Mlp.TYPE_HELLO) {
+                    throw new java.io.IOException("relay peer HELLO missing");
+                }
                 synchronized (relayLock) {
                     relaySocket = s;
                     relayOut = os;
@@ -225,14 +282,12 @@ public class LinkService extends Service {
         String sizeStr = Mlp.jsonString(json, "size");
         if (id == null) return;
         String safe = name == null ? "file.bin" : new File(name).getName();
-        File dir = new File(getExternalFilesDir(null), "Received");
-        dir.mkdirs();
         try {
             RelayRecv r = new RelayRecv();
             r.id = id; r.name = safe;
             r.size = sizeStr == null ? 0 : Long.parseLong(sizeStr);
             r.got = 0;
-            r.fos = new java.io.FileOutputStream(new File(dir, safe));
+            r.fos = openReceiveStream(safe);
             r.digest = MessageDigest.getInstance("SHA-256");
             relayRecv = r;
             relayWrite(Mlp.TYPE_FILE_ACK, Mlp.utf8("{\"id\":\"" + Mlp.jsonEscape(id) +
@@ -454,11 +509,9 @@ public class LinkService extends Service {
                              String xferId, String fileName, long size) {
         if (xferId == null || fileName == null) return;
         String safe = new File(fileName).getName();
-        File dir = new File(getExternalFilesDir(null), "Received");
-        dir.mkdirs();
-        File dst = new File(dir, safe);
         long got = 0, lastAck = 0;
-        try (FileOutputStream fos = new FileOutputStream(dst)) {
+        try (OutputStream fos = openReceiveStream(safe)) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
             String ack = "{\"id\":\"" + Mlp.jsonEscape(xferId) + "\",\"offset\":0,\"ok\":true}";
             Mlp.writeFrame(os, Mlp.TYPE_FILE_ACK, Mlp.utf8(ack), sessionKey);
             while (got < size) {
@@ -470,7 +523,9 @@ public class LinkService extends Service {
                 long offset = ((long)(p[16] & 0xFF) << 24) | ((long)(p[17] & 0xFF) << 16) |
                         ((long)(p[18] & 0xFF) << 8) | (p[19] & 0xFF);
                 byte[] data = Arrays.copyOfRange(p, 20, p.length);
-                fos.getChannel().write(java.nio.ByteBuffer.wrap(data), offset);
+                // Sender streams chunks sequentially; write in order and hash as we go.
+                fos.write(data);
+                digest.update(data);
                 got = offset + data.length;
                 if (got - lastAck > (1 << 20) || got == size) {
                     String a = "{\"id\":\"" + Mlp.jsonEscape(xferId) + "\",\"offset\":" + got + ",\"ok\":true}";
@@ -478,8 +533,9 @@ public class LinkService extends Service {
                     lastAck = got;
                 }
             }
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(java.nio.file.Files.readAllBytes(dst.toPath()));
-            String done = "{\"id\":\"" + Mlp.jsonEscape(xferId) + "\",\"sha256\":\"" + Mlp.hex(digest) + "\"}";
+            fos.flush();
+            String done = "{\"id\":\"" + Mlp.jsonEscape(xferId) + "\",\"sha256\":\"" +
+                    Mlp.hex(digest.digest()) + "\"}";
             Mlp.writeFrame(os, Mlp.TYPE_FILE_DONE, Mlp.utf8(done), sessionKey);
             fileCountStatic++;
             setStatus("文件已接收: " + safe);
