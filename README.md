@@ -61,7 +61,11 @@ Android App (Java)          Windows App (Go)
 
 ## 下载 / 构建产物
 
-构建产物放在 [`dist/`](dist/) 目录：
+**请从 [Releases 页面](https://github.com/donghuaigu123/MoreLink/releases) 下载最新构建产物**（二进制不存入 git 仓库，以减小仓库体积）：
+
+- 最新稳定版：[v2.2.0](https://github.com/donghuaigu123/MoreLink/releases/tag/v2.2.0)
+
+各版本包含：
 
 - `MoreLink-Windows.exe` — Windows x64 客户端（单文件，无需安装）
 - `MoreLink-Android.apk` — Android 客户端（minSdk 26 / Android 8.0+）
