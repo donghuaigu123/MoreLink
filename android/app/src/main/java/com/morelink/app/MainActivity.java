@@ -48,6 +48,7 @@ public class MainActivity extends Activity {
 
     private TextView statusView, peersView, infoView, logView;
     private EditText pinEdit, targetIpEdit, clipEdit;
+    private EditText relayHostEdit, relayPortEdit, relayRoomEdit, relayPinEdit;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { refresh(); }
@@ -123,12 +124,59 @@ public class MainActivity extends Activity {
         root.addView(section("④ 文件互传"));
         root.addView(button("选择文件发送到电脑", v -> pickFile()));
         TextView fhint = new TextView(this);
-        fhint.setText("接收文件保存在 Android/data/com.morelink.app/files/Received/");
+        SharedPreferences sp0 = getSharedPreferences(LinkService.PREFS, MODE_PRIVATE);
+        String recvDir = getExternalFilesDir(null) + "/Received";
+        fhint.setText("接收文件保存在:\n" + recvDir + "\n（可在下方“接收目录”中查看/另存）");
         fhint.setTextColor(MUTED);
         fhint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         root.addView(fhint);
+        root.addView(button("查看接收目录", v -> {
+            android.net.Uri uri = android.net.Uri.parse("content://com.morelink.app.files/" + recvDir);
+            try {
+                Intent i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(uri, "resource/folder");
+                startActivity(i);
+            } catch (Exception e) { toast("接收目录: " + recvDir); }
+        }));
 
-        root.addView(section("⑤ 权限与后台"));
+        root.addView(section("⑤ 跨网络中继（无公网IP时）"));
+        relayHostEdit = edit("中继服务器地址（域名或IP）");
+        relayHostEdit.setText(sp0.getString("relay_host", ""));
+        root.addView(panel(relayHostEdit));
+        relayPortEdit = edit("中继端口（默认 47893）");
+        relayPortEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        int rport = sp0.getInt("relay_port", Mlp.RELAY_PORT);
+        relayPortEdit.setText(String.valueOf(rport));
+        root.addView(panel(relayPortEdit));
+        relayRoomEdit = edit("房间码（两端相同）");
+        relayRoomEdit.setText(sp0.getString("relay_room", ""));
+        root.addView(panel(relayRoomEdit));
+        relayPinEdit = edit("中继配对码（两端相同的6位数字）");
+        relayPinEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        relayPinEdit.setText(sp0.getString("relay_pin", ""));
+        root.addView(panel(relayPinEdit));
+        LinearLayout relayRow = row();
+        relayRow.addView(button("连接中继", v -> {
+            String host = relayHostEdit.getText().toString().trim();
+            int port;
+            try { port = Integer.parseInt(relayPortEdit.getText().toString().trim()); }
+            catch (Exception e) { port = Mlp.RELAY_PORT; }
+            String room = relayRoomEdit.getText().toString().trim();
+            String pin = relayPinEdit.getText().toString().trim();
+            if (host.isEmpty() || room.isEmpty() || pin.length() != 6) {
+                toast("请填服务器地址、房间码和6位配对码"); return;
+            }
+            LinkService.setRelayEnabled(this, true, host, port, room, pin);
+            startService();
+            toast("正在连接中继…");
+        }));
+        relayRow.addView(button("断开中继", v -> {
+            LinkService.setRelayEnabled(this, false, "", Mlp.RELAY_PORT, "", "");
+            toast("中继已断开");
+        }));
+        root.addView(relayRow);
+
+        root.addView(section("⑥ 权限与后台"));
         root.addView(button("开启通知读取权限", v -> requestNotificationAccess()));
         root.addView(button("启动 / 保持后台运行", v -> { startService(); toast("服务已启动"); }));
 
@@ -246,7 +294,8 @@ public class MainActivity extends Activity {
     private void sendClip() {
         String ip = targetIpEdit.getText().toString().trim();
         String text = clipEdit.getText().toString();
-        if (ip.isEmpty()) { toast("请填写电脑 IP"); return; }
+        boolean relay = getSharedPreferences(LinkService.PREFS, MODE_PRIVATE).getBoolean("relay_enabled", false);
+        if (ip.isEmpty() && !relay) { toast("请填写电脑 IP（或先连接中继）"); return; }
         if (text.isEmpty()) { toast("请输入文本"); return; }
         toast(LinkService.sendClipboard(this, ip, Mlp.DATA_PORT, text));
     }
@@ -266,7 +315,8 @@ public class MainActivity extends Activity {
             Uri uri = data.getData();
             final String name = queryName(uri);
             final String ip = targetIpEdit.getText().toString().trim();
-            if (ip.isEmpty()) { toast("请先填写电脑 IP"); return; }
+            boolean relay = getSharedPreferences(LinkService.PREFS, MODE_PRIVATE).getBoolean("relay_enabled", false);
+            if (ip.isEmpty() && !relay) { toast("请先填写电脑 IP（或先连接中继）"); return; }
             new Thread(() -> {
                 String path = copyUriToCache(uri, name);
                 if (path == null) { runOnUiThread(() -> toast("无法读取文件")); return; }

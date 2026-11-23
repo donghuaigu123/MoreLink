@@ -45,6 +45,24 @@ public class LinkService extends Service {
     private DatagramSocket discovery;
     private final AtomicBoolean stopBeacon = new AtomicBoolean(false);
 
+    // ---- Relay session (long-lived connection through the relay server) ----
+    private static volatile Socket relaySocket;
+    private static volatile OutputStream relayOut;
+    private static volatile byte[] relayKey;
+    private static final Object relayLock = new Object();
+    private static final AtomicBoolean relayWanted = new AtomicBoolean(false);
+
+    // State for an in-progress file received over the relay.
+    private static class RelayRecv {
+        String id;
+        String name;
+        long size;
+        long got;
+        java.io.FileOutputStream fos;
+        java.security.MessageDigest digest;
+    }
+    private static volatile RelayRecv relayRecv;
+
     private String myId;
     private String myName;
     private byte[] key;
@@ -93,7 +111,178 @@ public class LinkService extends Service {
             pool.execute(this::discoveryLoop);
             pool.execute(this::serverLoop);
         }
+        // Auto-start relay session if configured.
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (sp.getBoolean("relay_enabled", false)) {
+            relayWanted.set(true);
+            pool.execute(this::relayLoop);
+        }
         return START_STICKY;
+    }
+
+    /** Long-lived session through the optional relay server. */
+    private void relayLoop() {
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        final String host = p.getString("relay_host", "");
+        final int port = p.getInt("relay_port", Mlp.RELAY_PORT);
+        final String room = p.getString("relay_room", "");
+        final String pin = p.getString("relay_pin", "");
+        if (host.isEmpty() || room.isEmpty() || pin.length() != 6) {
+            statusStatic = "中继配置不完整";
+            return;
+        }
+        final byte[] key = Mlp.deriveKey(pin, "", "");
+        while (running.get() && relayWanted.get()) {
+            Socket s = null;
+            try {
+                s = new Socket(host, port);
+                s.setSoTimeout(0);
+                OutputStream os = s.getOutputStream();
+                InputStream is = new BufferedInputStream(s.getInputStream());
+                // HELLO with room code; relay consumes this first frame.
+                String helloJson = Mlp.helloJson(myId, myName, "android", Mlp.DATA_PORT);
+                // inject room field
+                helloJson = helloJson.substring(0, helloJson.length() - 1) + ",\"room\":\"" +
+                        Mlp.jsonEscape(room) + "\"}";
+                Mlp.writeFrame(os, Mlp.TYPE_HELLO, Mlp.utf8(helloJson), null);
+                // Second HELLO travels transparently to the peer.
+                Mlp.writeFrame(os, Mlp.TYPE_HELLO,
+                        Mlp.utf8(Mlp.helloJson(myId, myName, "android", Mlp.DATA_PORT)), null);
+                synchronized (relayLock) {
+                    relaySocket = s;
+                    relayOut = os;
+                    relayKey = key;
+                }
+                paired = true;
+                statusStatic = "已连接中继房间 " + room;
+                sendBroadcast(new Intent(ACTION_STATE));
+                Log.d(TAG, "relay connected: " + host + ":" + port + " room=" + room);
+
+                // Serve incoming encrypted frames on this session.
+                while (running.get() && relayWanted.get()) {
+                    byte[] frame = Mlp.readFrame(is, key);
+                    if (frame == null) break;
+                    handleRelayFrame(frame, key);
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "relay loop: " + e.getMessage());
+                statusStatic = "中继重连中…";
+                sendBroadcast(new Intent(ACTION_STATE));
+            } finally {
+                synchronized (relayLock) {
+                    if (relaySocket == s) {
+                        relaySocket = null;
+                        relayOut = null;
+                        relayKey = null;
+                    }
+                }
+                try { if (s != null) s.close(); } catch (Exception ignored) {}
+            }
+            try { Thread.sleep(3000); } catch (InterruptedException e) { break; }
+        }
+    }
+
+    /** Process a frame received over the relay session. */
+    private void handleRelayFrame(byte[] frame, byte[] key) {
+        byte type = Mlp.frameType(frame);
+        byte[] payload = Mlp.framePayload(frame);
+        try {
+            switch (type) {
+                case Mlp.TYPE_PING:
+                    relayWrite(Mlp.TYPE_PONG, new byte[0]);
+                    break;
+                case Mlp.TYPE_CLIP_TEXT:
+                    ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                    if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("MoreLink", Mlp.str(payload)));
+                    notificationCountStatic++;
+                    statusStatic = "已接收剪贴板文本";
+                    sendBroadcast(new Intent(ACTION_STATE));
+                    break;
+                case Mlp.TYPE_FILE_OFFER:
+                    startRelayFileReceive(payload);
+                    break;
+                case Mlp.TYPE_FILE_CHUNK:
+                    handleRelayFileChunk(payload);
+                    break;
+                case Mlp.TYPE_FILE_DONE:
+                    fileCountStatic++;
+                    statusStatic = "文件发送完成（中继）";
+                    sendBroadcast(new Intent(ACTION_STATE));
+                    break;
+                case Mlp.TYPE_FILE_ACK:
+                    // Peer accepted our file offer; nothing else to do.
+                    break;
+            }
+        } catch (Exception e) {
+            Log.d(TAG, "relay frame: " + e.getMessage());
+        }
+    }
+
+    private void startRelayFileReceive(byte[] offerBytes) {
+        String json = Mlp.str(offerBytes);
+        String id = Mlp.jsonString(json, "id");
+        String name = Mlp.jsonString(json, "name");
+        String sizeStr = Mlp.jsonString(json, "size");
+        if (id == null) return;
+        String safe = name == null ? "file.bin" : new File(name).getName();
+        File dir = new File(getExternalFilesDir(null), "Received");
+        dir.mkdirs();
+        try {
+            RelayRecv r = new RelayRecv();
+            r.id = id; r.name = safe;
+            r.size = sizeStr == null ? 0 : Long.parseLong(sizeStr);
+            r.got = 0;
+            r.fos = new java.io.FileOutputStream(new File(dir, safe));
+            r.digest = MessageDigest.getInstance("SHA-256");
+            relayRecv = r;
+            relayWrite(Mlp.TYPE_FILE_ACK, Mlp.utf8("{\"id\":\"" + Mlp.jsonEscape(id) +
+                    "\",\"offset\":0,\"ok\":true}"));
+            statusStatic = "文件接收: " + safe;
+            sendBroadcast(new Intent(ACTION_STATE));
+        } catch (Exception e) {
+            Log.d(TAG, "startRelayFileReceive: " + e.getMessage());
+        }
+    }
+
+    private void handleRelayFileChunk(byte[] payload) {
+        RelayRecv r = relayRecv;
+        if (r == null || payload.length < 20) return;
+        try {
+            long offset = ((long)(payload[16] & 0xFF) << 24) | ((long)(payload[17] & 0xFF) << 16) |
+                    ((long)(payload[18] & 0xFF) << 8) | (long)(payload[19] & 0xFF);
+            int len = payload.length - 20;
+            if (offset == r.got) {
+                r.fos.write(payload, 20, len);
+                r.digest.update(payload, 20, len);
+                r.got += len;
+            }
+            if (r.got >= r.size && r.size > 0) {
+                r.fos.flush();
+                r.fos.close();
+                String sha = Mlp.hex(r.digest.digest());
+                relayWrite(Mlp.TYPE_FILE_DONE, Mlp.utf8("{\"id\":\"" + Mlp.jsonEscape(r.id) +
+                        "\",\"sha256\":\"" + sha + "\"}"));
+                fileCountStatic++;
+                statusStatic = "文件已接收: " + r.name;
+                sendBroadcast(new Intent(ACTION_STATE));
+                relayRecv = null;
+            }
+        } catch (Exception e) {
+            Log.d(TAG, "handleRelayFileChunk: " + e.getMessage());
+        }
+    }
+
+    /** Write a frame to the active relay session (thread-safe). */
+    private static boolean relayWrite(byte type, byte[] payload) {
+        synchronized (relayLock) {
+            if (relayOut == null || relayKey == null) return false;
+            try {
+                Mlp.writeFrame(relayOut, type, payload, relayKey);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
     }
 
     private Notification buildNotification(String text) {
@@ -337,9 +526,17 @@ public class LinkService extends Service {
         }
     }
 
-    /** Send clipboard text to a peer at ip:port (called from MainActivity). */
+    /** Send clipboard text to a peer (via relay if enabled, else direct). */
     public static String sendClipboard(Context c, String ip, int port, String text) {
         SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        if (p.getBoolean("relay_enabled", false)) {
+            if (relayWrite(Mlp.TYPE_CLIP_TEXT, Mlp.utf8(text))) {
+                statusStatic = "剪贴板已发送（中继）";
+                c.sendBroadcast(new Intent(ACTION_STATE));
+                return "已发送（中继）";
+            }
+            return "中继未连接，请稍候";
+        }
         if (!p.getBoolean("paired", false)) return "请先配对";
         byte[] key = Mlp.deriveKey(p.getString("pin", ""), p.getString("id", ""), p.getString("peer", ""));
         try (Socket s = new Socket(ip, port)) {
@@ -393,9 +590,12 @@ public class LinkService extends Service {
         }
     }
 
-    /** Send a local file to a peer at ip:port (Android -> PC). */
+    /** Send a local file to a peer (via relay if enabled, else direct). */
     public static String sendFile(Context c, String ip, int port, String path, String displayName) {
         SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        if (p.getBoolean("relay_enabled", false)) {
+            return sendFileRelay(c, path, displayName);
+        }
         if (!p.getBoolean("paired", false)) return "请先配对";
         byte[] key = Mlp.deriveKey(p.getString("pin", ""), p.getString("id", ""), p.getString("peer", ""));
         File src = new File(path);
@@ -440,6 +640,60 @@ public class LinkService extends Service {
         } catch (Exception e) {
             return "失败: " + e.getMessage();
         }
+    }
+
+    /** Send a file over the active relay session (fire-and-forget; ACK/DONE handled in relay loop). */
+    private static String sendFileRelay(Context c, String path, String displayName) {
+        if (relayOut == null || relayKey == null) return "中继未连接，请稍候";
+        File src = new File(path);
+        if (!src.exists()) return "文件不存在";
+        final String safe = displayName == null ? src.getName() : displayName;
+        final String xferId = Mlp.makeId();
+        try {
+            String offer = "{\"id\":\"" + Mlp.jsonEscape(xferId) + "\",\"name\":\"" +
+                    Mlp.jsonEscape(safe) + "\",\"size\":" + src.length() +
+                    ",\"mime\":\"application/octet-stream\"}";
+            relayWrite(Mlp.TYPE_FILE_OFFER, Mlp.utf8(offer));
+            byte[] buf = new byte[256 << 10];
+            long offset = 0;
+            java.io.FileInputStream fis = new java.io.FileInputStream(src);
+            int n;
+            while ((n = fis.read(buf)) > 0) {
+                byte[] chunk = new byte[20 + n];
+                byte[] idb = Mlp.utf8(xferId);
+                System.arraycopy(idb, 0, chunk, 0, Math.min(16, idb.length));
+                chunk[16] = (byte)(offset >>> 24);
+                chunk[17] = (byte)(offset >>> 16);
+                chunk[18] = (byte)(offset >>> 8);
+                chunk[19] = (byte)offset;
+                System.arraycopy(buf, 0, chunk, 20, n);
+                relayWrite(Mlp.TYPE_FILE_CHUNK, chunk);
+                offset += n;
+            }
+            fis.close();
+            statusStatic = "文件已发送（中继）: " + safe;
+            c.sendBroadcast(new Intent(ACTION_STATE));
+            return "已发送（中继）";
+        } catch (Exception e) {
+            return "失败: " + e.getMessage();
+        }
+    }
+
+    /** Enable or disable the relay session at runtime. */
+    public static void setRelayEnabled(Context c, boolean enabled, String host, int port, String room, String pin) {
+        SharedPreferences p = c.getSharedPreferences(PREFS, MODE_PRIVATE);
+        p.edit().putBoolean("relay_enabled", enabled).putString("relay_host", host)
+                .putInt("relay_port", port).putString("relay_room", room)
+                .putString("relay_pin", pin).apply();
+        relayWanted.set(enabled);
+        if (!enabled) {
+            synchronized (relayLock) {
+                try { if (relaySocket != null) relaySocket.close(); } catch (Exception ignored) {}
+                relaySocket = null; relayOut = null; relayKey = null;
+            }
+        }
+        statusStatic = enabled ? "正在连接中继…" : "中继已关闭";
+        c.sendBroadcast(new Intent(ACTION_STATE));
     }
 
     /** Generate a new pairing PIN and display it. */

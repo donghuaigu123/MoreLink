@@ -127,6 +127,46 @@ type transferItem struct {
 	Pct    float64 `json:"pct"`
 }
 
+type config struct {
+	Download  string `json:"download"`
+	RelayAddr string `json:"relay_addr"` // host:port of relay server
+	RelayRoom string `json:"relay_room"`
+	RelayPin  string `json:"relay_pin"`  // pairing PIN used via relay
+	AutoStart bool   `json:"autostart"`
+}
+
+func configPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "MoreLink", "config.json")
+}
+
+func loadConfig() config {
+	c := config{
+		Download:  filepath.Join(homeDir(), "MoreLink", "Received"),
+		RelayAddr: "",
+		RelayRoom: "",
+	}
+	b, err := os.ReadFile(configPath())
+	if err == nil {
+		_ = json.Unmarshal(b, &c)
+	}
+	if c.Download == "" {
+		c.Download = filepath.Join(homeDir(), "MoreLink", "Received")
+	}
+	_ = os.MkdirAll(c.Download, 0755)
+	return c
+}
+
+func (c config) save() {
+	b, _ := json.MarshalIndent(c, "", "  ")
+	_ = os.WriteFile(configPath(), b, 0644)
+}
+
+func homeDir() string {
+	h, _ := os.UserHomeDir()
+	return h
+}
+
 type app struct {
 	mu        sync.Mutex
 	id        string
@@ -142,25 +182,34 @@ type app struct {
 	log       []string
 	relayAddr string
 	room      string
+	cfg       config
+	relayOn   bool
+	relayStop chan struct{}
+	relayConn net.Conn
 
-	win     *winui.Window
-	ctrlPin *winui.Control
+	win       *winui.Window
+	ctrlPin   *winui.Control
 	ctrlPeers *winui.Control
 	ctrlNotify *winui.Control
-	ctrlLog *winui.Control
+	ctrlLog   *winui.Control
 	ctrlStatus *winui.Control
-	ctrlID *winui.Control
+	ctrlID    *winui.Control
+	ctrlRelayAddr *winui.Control
+	ctrlRelayRoom *winui.Control
+	ctrlRelayPin  *winui.Control
+	ctrlRelayBtn  *winui.Control
+	ctrlAutoStart *winui.Control
+	ctrlDownload  *winui.Control
 }
 
 func newApp() *app {
-	home, _ := os.UserHomeDir()
-	dl := filepath.Join(home, "MoreLink", "Received")
-	_ = os.MkdirAll(dl, 0755)
+	c := loadConfig()
 	return &app{
 		id:       mlp.MakeID(),
 		name:     hostName(),
 		peers:    map[string]*peer{},
-		download: dl,
+		download: c.Download,
+		cfg:      c,
 		status:   "就绪",
 	}
 }
@@ -566,12 +615,30 @@ func (a *app) pairWithPeer(ip string, port int, pin string) error {
 
 // ---------- relay mode ----------
 
-func (a *app) relayLoop(addr, room string, stop <-chan struct{}) {
+// relayLoop connects to the relay, joins a room, and serves the encrypted
+// session transparently tunnelled through the relay. The PIN from the UI is
+// used to derive the key so both peers agree even without direct discovery.
+func (a *app) relayLoop(addr, room, pin string, stop <-chan struct{}) {
+	// Ensure the session key is derived from the configured PIN.
+	if len(pin) == 6 {
+		a.mu.Lock()
+		a.pin = pin
+		a.key = mlp.DeriveKey(pin, "", "")
+		a.paired = true
+		a.mu.Unlock()
+	}
 	for {
 		select {
 		case <-stop:
 			return
 		default:
+		}
+		// If relay was turned off, stop the loop.
+		a.mu.Lock()
+		on := a.relayOn
+		a.mu.Unlock()
+		if !on {
+			return
 		}
 		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err != nil {
@@ -583,12 +650,18 @@ func (a *app) relayLoop(addr, room string, stop <-chan struct{}) {
 			}
 			continue
 		}
+		// Save the connection so toggleRelay can force-close it.
+		a.mu.Lock()
+		a.relayConn = conn
+		a.mu.Unlock()
 		h := a.hello()
 		h.Room = room
 		b, _ := json.Marshal(h)
 		_ = mlp.WriteFrame(conn, mlp.TypeHello, b, nil)
 		a.setStatus("已连接中继房间 " + room)
 		a.logf("已连接中继 %s 房间 %s", addr, room)
+		// Serve frames over the relayed connection. Since we are already paired,
+		// handleConn skips PAIR_REQ and goes straight to the encrypted loop.
 		a.handleConn(conn)
 		select {
 		case <-stop:
@@ -596,6 +669,47 @@ func (a *app) relayLoop(addr, room string, stop <-chan struct{}) {
 		case <-time.After(3 * time.Second):
 		}
 	}
+}
+
+// toggleRelay starts or stops the relay session based on current UI config.
+func (a *app) toggleRelay() string {
+	a.mu.Lock()
+	on := a.relayOn
+	a.mu.Unlock()
+	if on {
+		// Stop: close the live connection so the blocked reader unblocks, and
+		// close the stop channel so the reconnect loop exits immediately.
+		a.mu.Lock()
+		a.relayOn = false
+		if a.relayConn != nil {
+			_ = a.relayConn.Close()
+			a.relayConn = nil
+		}
+		if a.relayStop != nil {
+			close(a.relayStop)
+			a.relayStop = nil
+		}
+		a.key = nil
+		a.paired = false
+		a.mu.Unlock()
+		a.setStatus("中继已断开")
+		a.logf("中继已断开")
+		return "已断开中继"
+	}
+	addr := strings.TrimSpace(a.cfg.RelayAddr)
+	room := strings.TrimSpace(a.cfg.RelayRoom)
+	pin := strings.TrimSpace(a.cfg.RelayPin)
+	if addr == "" || room == "" || len(pin) != 6 {
+		return "请填写中继地址、房间码和 6 位配对码"
+	}
+	a.mu.Lock()
+	a.relayOn = true
+	stop := make(chan struct{})
+	a.relayStop = stop
+	a.mu.Unlock()
+	go a.relayLoop(addr, room, pin, stop)
+	a.logf("正在连接中继 %s 房间 %s", addr, room)
+	return "正在连接中继…（对端也需连接同一房间）"
 }
 
 // ---------- GUI ----------
@@ -610,48 +724,89 @@ const (
 	cmdRefreshPeers
 	cmdRelayConnect
 	cmdCopyPin
+	cmdAutoStart
+	cmdChooseDir
+	cmdTrayRestore
+	cmdTrayQuit
 )
 
 func (a *app) buildUI(w *winui.Window) {
 	a.win = w
+	winui.AddTrayIcon(w.H, "MoreLink 跨设备协同")
 
 	// Row 1: identity + pairing
-	w.Label("本机设备 ID:", 20, 86, 110, 26)
-	a.ctrlID = w.Label(a.id, 130, 86, 340, 26)
-	w.Label("配对码:", 490, 86, 70, 26)
-	a.ctrlPin = w.Edit("", 560, 82, 130, 30)
-	w.ButtonID(cmdGenPin, "🎲 生成", 700, 80, 90, 34)
-	w.ButtonID(cmdCopyPin, "📋 复制", 800, 80, 90, 34)
+	w.Label("本机设备 ID:", 20, 84, 110, 24)
+	a.ctrlID = w.Label(a.id, 130, 84, 330, 24)
+	w.Label("配对码:", 470, 84, 60, 24)
+	a.ctrlPin = w.Edit("", 534, 80, 110, 28)
+	w.ButtonID(cmdGenPin, "🎲 生成", 652, 78, 80, 32)
+	w.ButtonID(cmdCopyPin, "📋 复制", 738, 78, 80, 32)
+	a.ctrlAutoStart = w.ButtonID(cmdAutoStart, "开机自启", 824, 78, 110, 32)
 
-	w.Label("首次使用：任一端生成 6 位配对码，两端填入相同配对码后点“配对”。", 20, 120, 860, 24)
+	// Relay config row
+	w.Label("跨网络中继（无公网IP时）：", 20, 116, 210, 24)
+	a.ctrlRelayAddr = w.Edit(a.cfg.RelayAddr, 230, 112, 250, 28)
+	a.ctrlRelayRoom = w.Edit(a.cfg.RelayRoom, 488, 112, 120, 28)
+	a.ctrlRelayPin = w.Edit(a.cfg.RelayPin, 616, 112, 110, 28)
+	a.ctrlRelayBtn = w.ButtonID(cmdRelayConnect, "连接中继", 732, 110, 110, 32)
+	w.Label("服务器地址:端口      房间码       配对码", 230, 140, 500, 20)
+
+	// Download directory row
+	w.Label("接收目录:", 20, 164, 80, 24)
+	a.ctrlDownload = w.Label(a.download, 100, 164, 640, 24)
+	w.ButtonID(cmdChooseDir, "📁 更改目录", 750, 160, 184, 30)
 
 	// Peers list
-	w.Label("附近设备 / 已配对设备（点击选择）", 20, 156, 500, 26)
-	a.ctrlPeers = w.ListBox(20, 184, 560, 210)
-	w.ButtonID(cmdPair, "配对到选中设备", 600, 190, 280, 38)
+	w.Label("附近设备 / 已配对设备（点击选择）", 20, 196, 500, 24)
+	a.ctrlPeers = w.ListBox(20, 222, 560, 180)
+	w.ButtonID(cmdPair, "配对到选中设备", 600, 226, 320, 36)
 
 	// Status
-	w.Label("状态:", 20, 404, 60, 26)
-	a.ctrlStatus = w.Label("就绪", 80, 404, 800, 26)
+	w.Label("状态:", 20, 412, 50, 24)
+	a.ctrlStatus = w.Label("就绪", 74, 412, 810, 24)
 
 	// Actions
-	w.Label("操作（先选中设备）", 20, 440, 400, 26)
-	w.ButtonID(cmdSendClip, "📄 发送剪贴板文本", 20, 470, 200, 40)
-	w.ButtonID(cmdSendFile, "📎 发送文件", 230, 470, 180, 40)
-	w.ButtonID(cmdOpenFolder, "📂 打开接收目录", 420, 470, 200, 40)
-	w.ButtonID(cmdClearNotify, "🧹 清空通知", 630, 470, 160, 40)
-	w.ButtonID(cmdRefreshPeers, "🔄 重扫设备", 800, 470, 120, 40)
+	w.Label("操作（先选中设备）", 20, 442, 400, 24)
+	w.ButtonID(cmdSendClip, "📄 发送剪贴板文本", 20, 470, 200, 38)
+	w.ButtonID(cmdSendFile, "📎 发送文件", 230, 470, 180, 38)
+	w.ButtonID(cmdOpenFolder, "📂 打开接收目录", 420, 470, 200, 38)
+	w.ButtonID(cmdClearNotify, "🧹 清空通知", 630, 470, 160, 38)
+	w.ButtonID(cmdRefreshPeers, "🔄 重扫设备", 800, 470, 134, 38)
 
 	// Notifications
-	w.Label("手机通知（点击设备配对后自动同步）", 20, 524, 500, 26)
-	a.ctrlNotify = w.ListBox(20, 552, 560, 200)
+	w.Label("手机通知（配对后自动同步）", 20, 520, 500, 24)
+	a.ctrlNotify = w.ListBox(20, 546, 560, 180)
 
 	// Log
-	w.Label("事件日志", 600, 524, 200, 26)
-	a.ctrlLog = w.MultiEdit(600, 552, 320, 200)
+	w.Label("事件日志", 600, 520, 200, 24)
+	a.ctrlLog = w.MultiEdit(600, 546, 334, 180)
 
 	w.OnCommand = a.onCommand
 	w.OnTimer = a.refreshUI
+	w.OnClose = func() bool {
+		winui.HideWindow(w.H)
+		winui.UpdateTrayIcon(w.H, "MoreLink（后台运行中）")
+		return true
+	}
+	w.OnTray = func(msg uintptr) {
+		switch msg {
+		case 0x0203: // WM_LBUTTONDBLCLK
+			winui.ShowWindow(w.H)
+		case 0x0205: // WM_RBUTTONUP
+			sel := winui.TrackPopupMenu(w.H, []winui.TrayMenuItem{
+				{ID: cmdTrayRestore, Text: "显示窗口"},
+				{Sep: true},
+				{ID: cmdTrayQuit, Text: "退出 MoreLink"},
+			})
+			switch sel {
+			case cmdTrayRestore:
+				winui.ShowWindow(w.H)
+			case cmdTrayQuit:
+				winui.RemoveTrayIcon(w.H)
+				w.Quit()
+			}
+		}
+	}
 }
 
 func (a *app) refreshUI() {
@@ -827,7 +982,53 @@ func (a *app) onCommand(id uintptr) {
 
 	case cmdRefreshPeers:
 		a.logf("重新扫描局域网设备…")
+
+	case cmdRelayConnect:
+		// Persist relay config from UI.
+		a.cfg.RelayAddr = strings.TrimSpace(a.ctrlRelayAddr.Text())
+		a.cfg.RelayRoom = strings.TrimSpace(a.ctrlRelayRoom.Text())
+		a.cfg.RelayPin = strings.TrimSpace(a.ctrlRelayPin.Text())
+		a.cfg.save()
+		msg := a.toggleRelay()
+		a.ctrlRelayBtn.SetText(map[bool]string{true: "断开中继", false: "连接中继"}[a.isRelayOn()])
+		winui.MessageBox(a.win.H, msg, "跨网络中继", winui.MB_ICONINFORMATION)
+
+	case cmdAutoStart:
+		on := a.ctrlAutoStart.Checked()
+		if err := winui.SetAutoStart("MoreLink", on); err != nil {
+			a.logf("设置自启动失败: %v", err)
+		}
+		a.cfg.AutoStart = on
+		a.cfg.save()
+		if on {
+			a.logf("已开启开机自启动")
+		} else {
+			a.logf("已关闭开机自启动")
+		}
+
+	case cmdChooseDir:
+		dir := winui.SelectFolder(a.win.H, "选择文件接收目录")
+		if dir == "" {
+			return
+		}
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			winui.MessageBox(a.win.H, "目录不可写："+err.Error(), "提示", winui.MB_ICONERROR)
+			return
+		}
+		a.mu.Lock()
+		a.download = dir
+		a.cfg.Download = dir
+		a.mu.Unlock()
+		a.cfg.save()
+		a.ctrlDownload.SetText(dir)
+		a.logf("接收目录已改为: %s", dir)
 	}
+}
+
+func (a *app) isRelayOn() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.relayOn
 }
 
 func main() {
@@ -853,11 +1054,15 @@ func main() {
 	stop := make(chan struct{})
 	go a.discoveryLoop(stop)
 	if *relayAddr != "" && *room != "" {
-		go a.relayLoop(*relayAddr, *room, stop)
+		// Command-line relay mode (legacy): PIN falls back to config.
+		a.cfg.RelayAddr = *relayAddr
+		a.cfg.RelayRoom = *room
+		a.relayOn = true
+		go a.relayLoop(*relayAddr, *room, a.cfg.RelayPin, stop)
 	}
 
-	winui.Logf("启动窗口 960x800，准备注册 Win32 窗口类")
-	w := winui.NewWindow("MoreLink · 跨设备协同中心 v2", 960, 800)
+	winui.Logf("启动窗口 960x750，准备注册 Win32 窗口类")
+	w := winui.NewWindow("MoreLink · 跨设备协同中心 v2.1", 960, 750)
 	w.OnCreate = func() { a.buildUI(w) }
 	winui.Logf("进入消息循环")
 	err = w.Create()

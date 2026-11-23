@@ -19,3 +19,7 @@ android/.idea/
 # IDE
 .vscode/
 .idea/
+
+# build artifacts & screenshots (distributed via Releases)
+dist/
+docs/*.png

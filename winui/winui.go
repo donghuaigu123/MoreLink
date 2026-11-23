@@ -125,6 +125,8 @@ const (
 	WM_PAINT         = 0x000F
 	WM_TIMER         = 0x0113
 	WM_CLOSE         = 0x0010
+	WM_USER          = 0x0400
+	WM_TRAYICON      = WM_USER + 100  // custom tray callback message
 	WM_CTLCOLORSTATIC  = 0x0138
 	WM_CTLCOLOREDIT    = 0x0133
 	WM_CTLCOLORBTN     = 0x0135
@@ -164,8 +166,13 @@ const (
 	WS_TABSTOP          = 0x00010000
 	WS_CLIPCHILDREN     = 0x02000000
 
-	BS_PUSHBUTTON = 0
-	BS_OWNERDRAW  = 0x0000000B
+	BS_PUSHBUTTON   = 0
+	BS_OWNERDRAW    = 0x0000000B
+	BS_AUTOCHECKBOX = 0x00000003
+	BM_GETCHECK     = 0x00F0
+	BM_SETCHECK     = 0x00F1
+	BST_UNCHECKED   = 0
+	BST_CHECKED     = 1
 
 	ES_LEFT       = 0
 	ES_AUTOHSCROLL = 0x0080
@@ -331,9 +338,14 @@ type Window struct {
 	OnTimer       func()
 	OnDrawItem    func(*DRAWITEMSTRUCT)
 	OnPaintExtra  func(hdc HDC, rc RECT)
-	Controls      map[uintptr]*Control
-	nextID        uintptr
-	wndProc       uintptr
+	// OnClose, if set and returns true, suppresses the default quit — used to
+	// hide the window into the system tray instead of exiting.
+	OnClose  func() bool
+	// OnTray receives tray icon mouse messages (WM_LBUTTONDBLCLK, WM_RBUTTONUP).
+	OnTray   func(msg uintptr)
+	Controls map[uintptr]*Control
+	nextID   uintptr
+	wndProc  uintptr
 }
 
 func NewWindow(title string, width, height int) *Window {
@@ -347,6 +359,11 @@ func (w *Window) nextCtrlID() uintptr {
 	id := w.nextID
 	w.nextID++
 	return id
+}
+
+// Quit posts a WM_QUIT message, exiting the message loop.
+func (w *Window) Quit() {
+	pPostQuitMessage.Call(0)
 }
 
 func (w *Window) addControl(h HWND) *Control {
@@ -429,11 +446,23 @@ func (w *Window) proc(hwnd HWND, msg uint32, wp, lp uintptr) uintptr {
 
 	case WM_DESTROY:
 		pKillTimer.Call(uintptr(hwnd), 1)
+		RemoveTrayIcon(hwnd)
 		pPostQuitMessage.Call(0)
 		return 0
 
 	case WM_CLOSE:
+		// If the app registered an OnClose handler that returns true, it has
+		// hidden itself into the tray; do not quit the message loop.
+		if w.OnClose != nil && w.OnClose() {
+			return 0
+		}
 		pPostQuitMessage.Call(0)
+		return 0
+
+	case WM_TRAYICON:
+		if w.OnTray != nil {
+			w.OnTray(lp)
+		}
 		return 0
 
 	case WM_TIMER:
@@ -572,6 +601,26 @@ func (w *Window) ButtonID(id uintptr, text string, x, y, width, height int) *Con
 // ListBox creates a list box control.
 func (w *Window) ListBox(x, y, width, height int) *Control {
 	return w.createCtrl("LISTBOX", "", LBS_STANDARD|WS_VSCROLL, x, y, width, height, 0)
+}
+
+// Checkbox creates an auto checkbox control.
+func (w *Window) Checkbox(text string, x, y, width, height int) *Control {
+	return w.createCtrl("BUTTON", text, BS_AUTOCHECKBOX|WS_TABSTOP, x, y, width, height, 0)
+}
+
+// SetChecked sets a checkbox state.
+func (c *Control) SetChecked(on bool) {
+	v := uintptr(BST_UNCHECKED)
+	if on {
+		v = BST_CHECKED
+	}
+	pSendMessage.Call(uintptr(c.H), BM_SETCHECK, v, 0)
+}
+
+// Checked reads a checkbox state.
+func (c *Control) Checked() bool {
+	r, _, _ := pSendMessage.Call(uintptr(c.H), BM_GETCHECK, 0, 0)
+	return r == BST_CHECKED
 }
 
 func (c *Control) SetText(text string) {
